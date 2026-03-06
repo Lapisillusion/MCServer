@@ -1,55 +1,74 @@
-﻿// ConnectionContext.cs
+// ConnectionContext.cs
 
+using System.Collections.Generic;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace GateWay;
 
+public enum IoOperation : byte
+{
+    Accept,
+    ClientRecv,
+    BackendRecv,
+    BackendSend,
+    ClientSend
+}
+
+public sealed class IoToken
+{
+    public required IoOperation Operation;
+    public ConnectionContext? Context;
+}
+
+public sealed class SendWorkItem
+{
+    public required ArraySegment<byte> Segment1;
+    public ArraySegment<byte> Segment2;
+    public required int TotalLength;
+    public byte[]? Rented;
+    public bool FromClientInboundRing;
+    public int SegmentIndex;
+    public int SegmentOffset;
+}
+
+public sealed class SendChannel
+{
+    public readonly Queue<SendWorkItem> Queue = new();
+    public readonly object Sync = new();
+    public SendWorkItem? Current;
+    public bool Sending;
+}
+
 public sealed class ConnectionContext
 {
-    public readonly ByteRingBuffer Inbound = new();
-    public Socket Backend = null!;
+    private int _closed;
 
+    public readonly ByteRingBuffer ClientInbound = new();
+    public readonly SendChannel BackendSend = new();
+    public readonly SendChannel ClientSend = new();
+    public readonly object ParserSync = new();
+
+    public Socket Backend = null!;
     public Socket Client = null!;
 
-    // 简化：发送直接用 Socket.SendAsync(SAEA)；MVP 先不做复杂发送队列
-    public volatile bool Closed;
+    public SocketAsyncEventArgs BackendRecvSaea = null!;
+    public SocketAsyncEventArgs BackendSendSaea = null!;
+    public SocketAsyncEventArgs ClientRecvSaea = null!;
+    public SocketAsyncEventArgs ClientSendSaea = null!;
+
+    public long LastActivityTicks;
+    public int Id;
+    public int ParsedClientBytes;
+    public bool LoginSlotHeld;
     public uint IpV4;
+    public int InvalidPacketCount;
     public ConnState State = ConnState.Handshake;
 
-    public void Close()
+    public bool Closed => Volatile.Read(ref _closed) != 0;
+
+    public bool TryMarkClosed()
     {
-        if (Closed) return;
-        Closed = true;
-        try
-        {
-            Client.Shutdown(SocketShutdown.Both);
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            Backend.Shutdown(SocketShutdown.Both);
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            Client.Close();
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            Backend.Close();
-        }
-        catch
-        {
-        }
+        return Interlocked.CompareExchange(ref _closed, 1, 0) == 0;
     }
 }

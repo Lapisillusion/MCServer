@@ -76,16 +76,52 @@ public sealed class ByteRingBuffer
     // Peek: copy up to len bytes into dst without consuming
     public int Peek(Span<byte> dst, int len)
     {
-        len = Math.Min(len, Count);
+        return PeekAt(0, dst, len);
+    }
+
+    // Peek at an offset from the current read index without consuming.
+    public int PeekAt(int offset, Span<byte> dst, int len)
+    {
+        if (offset < 0 || offset > Count)
+            return 0;
+
+        var available = Count - offset;
+        len = Math.Min(len, available);
         if (len == 0) return 0;
 
-        var first = Math.Min(len, Capacity - _r);
-        _buf.AsSpan(_r, first).CopyTo(dst[..first]);
+        var start = (_r + offset) % Capacity;
+        var first = Math.Min(len, Capacity - start);
+        _buf.AsSpan(start, first).CopyTo(dst[..first]);
         var remain = len - first;
         if (remain > 0)
             _buf.AsSpan(0, remain).CopyTo(dst.Slice(first, remain));
 
         return len;
+    }
+
+    // Get up to two readable segments for zero-copy send.
+    public bool TryGetReadSegments(int offset, int len, out ArraySegment<byte> first, out ArraySegment<byte> second)
+    {
+        first = default;
+        second = default;
+
+        if (offset < 0 || len < 0)
+            return false;
+
+        if (offset + len > Count)
+            return false;
+
+        if (len == 0)
+            return true;
+
+        var start = (_r + offset) % Capacity;
+        var firstLen = Math.Min(len, Capacity - start);
+        first = new ArraySegment<byte>(_buf, start, firstLen);
+        var remain = len - firstLen;
+        if (remain > 0)
+            second = new ArraySegment<byte>(_buf, 0, remain);
+
+        return true;
     }
 
     public void Skip(int len)
