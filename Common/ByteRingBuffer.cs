@@ -2,7 +2,7 @@
 
 using System.Buffers;
 
-namespace GateWay;
+namespace Common;
 
 public sealed class ByteRingBuffer
 {

@@ -4,7 +4,7 @@ using System.Collections.Concurrent;
 using System.Threading;
 using System.Net.Sockets;
 
-namespace GateWay;
+namespace Common;
 
 public sealed class SaeaPool
 {

@@ -1,5 +1,7 @@
 ﻿// McFrameParser.cs
 
+using Common;
+
 namespace GateWay;
 
 public static class McFrameParser

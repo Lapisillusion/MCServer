@@ -2,7 +2,7 @@
 
 using System.Net;
 
-namespace GateWay;
+namespace Common;
 
 public static class IpUtils
 {
