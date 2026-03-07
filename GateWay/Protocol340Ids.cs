@@ -11,6 +11,8 @@ public static class Protocol340Ids
     public const int C2S_StatusPing = 0x01; // Status state
     public const int C2S_LoginStart = 0x00; // Login state
     public const int S2C_LoginSuccess = 0x02; // Login state
+    public const int S2C_StatusResponse = 0x00; // Status state
+    public const int S2C_StatusPong = 0x01; // Status state
 
     // 可选：如果你要在网关直接返回断开原因（MVP 可不做）
     // public const int S2C_LoginDisconnect = ...

@@ -109,4 +109,32 @@ public static class McFrameParser
         // 可进一步校验字符集
         return true;
     }
+
+    public static bool TryIsStatusRequest(ReadOnlySpan<byte> frameSpan)
+    {
+        var off = 0;
+        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen)) return false;
+        if (payloadLen != 1) return false;
+        if (!VarInt.TryRead(frameSpan, ref off, out var pid)) return false;
+        return pid == Protocol340Ids.C2S_StatusRequest && off == frameSpan.Length;
+    }
+
+    public static bool TryReadStatusPingPayload(ReadOnlySpan<byte> frameSpan, out long payload)
+    {
+        payload = 0;
+
+        var off = 0;
+        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen)) return false;
+        if (!VarInt.TryRead(frameSpan, ref off, out var pid)) return false;
+        if (pid != Protocol340Ids.C2S_StatusPing) return false;
+        if (payloadLen != 9) return false; // packetId(1) + long(8)
+        if (off + 8 != frameSpan.Length) return false;
+
+        ulong value = 0;
+        for (var i = 0; i < 8; i++)
+            value = (value << 8) | frameSpan[off + i];
+
+        payload = unchecked((long)value);
+        return true;
+    }
 }

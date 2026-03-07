@@ -62,6 +62,7 @@ public sealed class ConnectionContext
     public int Id;
     public int ParsedClientBytes;
     public bool LoginSlotHeld;
+    public bool CloseAfterStatusPong;
     public uint IpV4;
     public int InvalidPacketCount;
     public ConnState State = ConnState.Handshake;

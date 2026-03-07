@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using Common;
 using Serilog;
@@ -27,6 +28,8 @@ public sealed class GateWayServer
     private static readonly TimeSpan TempBanDuration = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan LoginTimeout = TimeSpan.FromSeconds(5);
+    private const string StatusResponseFileName = "status-response.json";
+    private static readonly byte[] StatusResponseFrame = BuildStatusResponseFrame();
 
     private readonly IPEndPoint _backendEp;
     private readonly Blacklist _blacklist;
@@ -383,6 +386,33 @@ public sealed class GateWayServer
                             ctx.Id, ConnState.Handshake, ConnState.Login);
                     }
                 }
+                else if (ctx.State == ConnState.Status)
+                {
+                    if (pid == Protocol340Ids.C2S_StatusRequest)
+                    {
+                        
+                        if (!McFrameParser.TryIsStatusRequest(frameSpan))
+                        {
+                            Logger.Warning("StatusRequest validate failed, ctxId={ContextId}", ctx.Id);
+                            RegisterInvalidPacketAndClose(ctx);
+                            return;
+                        }
+
+                        Logger.Information("接收到Status--Request请求");
+                        SendStatusResponse(ctx);
+                    }
+                    else if (pid == Protocol340Ids.C2S_StatusPing)
+                    {
+                        if (!McFrameParser.TryReadStatusPingPayload(frameSpan, out var payload))
+                        {
+                            Logger.Warning("StatusPing parse failed, ctxId={ContextId}", ctx.Id);
+                            RegisterInvalidPacketAndClose(ctx);
+                            return;
+                        }
+                        Logger.Information("接收到Status--Ping请求");
+                        SendStatusPongAndClose(ctx, payload);
+                    }
+                }
                 else if (ctx.State == ConnState.Login && pid == Protocol340Ids.C2S_LoginStart)
                 {
                     if (!_limiter.TryAcceptLogin(ctx.IpV4))
@@ -408,6 +438,19 @@ public sealed class GateWayServer
             }
 
             ctx.ParsedClientBytes += frameLen;
+            if (ctx.State == ConnState.Status)
+            {
+                lock (ctx.ParserSync)
+                {
+                    ctx.ClientInbound.Skip(frameLen);
+                    ctx.ParsedClientBytes -= frameLen;
+                    if (ctx.ParsedClientBytes < 0)
+                        ctx.ParsedClientBytes = 0;
+                }
+
+                continue;
+            }
+
             EnqueueBackendZeroCopy(ctx, seg1, seg2, frameLen);
         }
     }
@@ -604,6 +647,12 @@ public sealed class GateWayServer
 
         if (finished)
             CompleteCurrentSendItem(ctx, channel);
+
+        if (finished && ReferenceEquals(channel, ctx.ClientSend) && ctx.CloseAfterStatusPong)
+        {
+            CloseContext(ctx, false, "status-pong-sent");
+            return;
+        }
 
         if (!ctx.Closed)
             TrySendNext(ctx, channel, socketSelector(ctx), e, channelName);
@@ -826,4 +875,108 @@ public sealed class GateWayServer
     {
         return $"{(ip >> 24) & 0xFF}.{(ip >> 16) & 0xFF}.{(ip >> 8) & 0xFF}.{ip & 0xFF}";
     }
+
+    private void SendStatusResponse(ConnectionContext ctx)
+    {
+        var rent = ArrayPool<byte>.Shared.Rent(StatusResponseFrame.Length);
+        Buffer.BlockCopy(StatusResponseFrame, 0, rent, 0, StatusResponseFrame.Length);
+        var item = new SendWorkItem
+        {
+            Segment1 = new ArraySegment<byte>(rent, 0, StatusResponseFrame.Length),
+            Segment2 = default,
+            TotalLength = StatusResponseFrame.Length,
+            Rented = rent
+        };
+
+        EnqueueSend(ctx, ctx.ClientSend, item, ctx.Client, ctx.ClientSendSaea, "client-send");
+    }
+
+    private void SendStatusPongAndClose(ConnectionContext ctx, long payload)
+    {
+        var frame = BuildStatusPongFrame(payload);
+        var item = new SendWorkItem
+        {
+            Segment1 = new ArraySegment<byte>(frame, 0, frame.Length),
+            Segment2 = default,
+            TotalLength = frame.Length,
+            Rented = frame
+        };
+
+        ctx.CloseAfterStatusPong = true;
+        EnqueueSend(ctx, ctx.ClientSend, item, ctx.Client, ctx.ClientSendSaea, "client-send");
+    }
+
+    private static byte[] BuildStatusResponseFrame()
+    {
+        const string fallbackJson =
+            "{\"version\":{\"name\":\"1.12.2\",\"protocol\":340},\"players\":{\"max\":100,\"online\":0,\"sample\":[]},\"description\":{\"text\":\"MC GateWay 1.12.2\"}}";
+
+        var json = LoadStatusResponseJsonOrFallback(fallbackJson);
+
+        var jsonBytes = Encoding.UTF8.GetBytes(json);
+        Span<byte> varIntBuf = stackalloc byte[5];
+
+        var jsonLenVarInt = VarInt.Write(varIntBuf, jsonBytes.Length);
+        var payloadLen = 1 + jsonLenVarInt + jsonBytes.Length; // packetId + string len + string bytes
+        var frameLenVarInt = VarInt.Write(varIntBuf, payloadLen);
+
+        var frame = new byte[frameLenVarInt + payloadLen];
+        var offset = 0;
+
+        offset += VarInt.Write(frame.AsSpan(offset), payloadLen);
+        frame[offset++] = (byte)Protocol340Ids.S2C_StatusResponse;
+        offset += VarInt.Write(frame.AsSpan(offset), jsonBytes.Length);
+        jsonBytes.CopyTo(frame.AsSpan(offset));
+
+        return frame;
+    }
+
+    private static string LoadStatusResponseJsonOrFallback(string fallbackJson)
+    {
+        var filePath = Path.Combine(AppContext.BaseDirectory, StatusResponseFileName);
+        try
+        {
+            if (!File.Exists(filePath))
+            {
+                Logger.Warning("Status response file not found, using fallback JSON. path={Path}", filePath);
+                return fallbackJson;
+            }
+
+            var json = File.ReadAllText(filePath, Encoding.UTF8).Trim();
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                Logger.Warning("Status response file is empty, using fallback JSON. path={Path}", filePath);
+                return fallbackJson;
+            }
+
+            return json;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning(ex, "Read status response file failed, using fallback JSON. path={Path}", filePath);
+            return fallbackJson;
+        }
+    }
+
+    private static byte[] BuildStatusPongFrame(long payload)
+    {
+        const int pongPayloadLen = 1 + 8; // packetId + long
+        Span<byte> varIntBuf = stackalloc byte[5];
+        var frameLenVarInt = VarInt.Write(varIntBuf, pongPayloadLen);
+        var frame = ArrayPool<byte>.Shared.Rent(frameLenVarInt + pongPayloadLen);
+
+        var offset = 0;
+        offset += VarInt.Write(frame.AsSpan(offset), pongPayloadLen);
+        frame[offset++] = (byte)Protocol340Ids.S2C_StatusPong;
+
+        var value = unchecked((ulong)payload);
+        for (var i = 7; i >= 0; i--)
+        {
+            frame[offset + i] = (byte)(value & 0xFF);
+            value >>= 8;
+        }
+
+        return frame;
+    }
 }
+
