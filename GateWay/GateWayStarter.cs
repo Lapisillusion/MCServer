@@ -1,23 +1,52 @@
-﻿using System.Net;
+using System.Net;
 using GateWay;
+using Serilog;
+using Serilog.Events;
 
 public class GateWayStarter
 {
+    /// <summary>
+    /// 网关主入口
+    /// </summary>
     public static void Main()
     {
-        var listen = new IPEndPoint(IPAddress.Any, 25565);
-        var backend = new IPEndPoint(IPAddress.Parse("127.0.0.1"), 25566);
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Debug()
+            .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
+            .Enrich.FromLogContext()
+            .WriteTo.Console()
+            .WriteTo.File(
+                path: "logs/gateway-.log",
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: 14,
+                shared: true)
+            .CreateLogger();
 
-        var blacklist = new Blacklist();
-        // blacklist.AddIp("1.2.3.4");
-        // blacklist.AddCidr("5.6.7.0/24");
+        try
+        {
+            var listen = new IPEndPoint(IPAddress.Any, 25565);
+            var backend = new IPEndPoint(IPAddress.Parse("127.0.0.1"), 25566);
 
-        var limiter = new RateLimiter();
+            var blacklist = new Blacklist();
+            // blacklist.AddIp("1.2.3.4");
+            // blacklist.AddCidr("5.6.7.0/24");
 
-        var server = new GateWayServer(listen, backend, blacklist, limiter);
-        server.Start();
+            var limiter = new RateLimiter();
 
-        Console.WriteLine("Press Enter to quit.");
-        Console.ReadLine();
+            var server = new GateWayServer(listen, backend, blacklist, limiter);
+            server.Start();
+
+            Log.Information("Press Enter to quit.");
+            Console.ReadLine();
+        }
+        catch (Exception ex)
+        {
+            Log.Fatal(ex, "Gateway terminated unexpectedly");
+            throw;
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+        }
     }
 }

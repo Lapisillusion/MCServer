@@ -7,15 +7,20 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using Common;
+using Serilog;
 
 namespace GateWay;
 
 public sealed class GateWayServer
 {
+    private static readonly Serilog.ILogger Logger = Log.ForContext<GateWayServer>();
+
     private const int AcceptPoolInitial = 256;
     private const int AcceptPoolMax = 2048;
     private const int IoPoolInitial = 4096;
     private const int IoPoolMax = 50000;
+    private const int IoTokenPoolInitial = IoPoolInitial + AcceptPoolInitial;
+    private const int IoTokenPoolMax = IoPoolMax + AcceptPoolMax;
     private const int IoBufferSize = 32 * 1024;
     private const int InvalidPacketBanThreshold = 3;
     private const int LoginInProgressLimit = 2000;
@@ -30,6 +35,7 @@ public sealed class GateWayServer
     private readonly SaeaPool _acceptPool;
     private readonly ConcurrentDictionary<int, ConnectionContext> _contexts = new();
     private readonly SaeaPool _ioPool;
+    private readonly ObjectPool<IoToken> _ioTokenPool;
     private readonly double _ticksPerSec = Stopwatch.Frequency;
 
     private Socket _listen = null!;
@@ -46,6 +52,15 @@ public sealed class GateWayServer
 
         _acceptPool = new SaeaPool(AcceptPoolInitial, AcceptPoolMax, 0, OnIoCompleted);
         _ioPool = new SaeaPool(IoPoolInitial, IoPoolMax, IoBufferSize, OnIoCompleted);
+        _ioTokenPool = new ObjectPool<IoToken>(
+            IoTokenPoolInitial,
+            IoTokenPoolMax,
+            () => new IoToken(),
+            token =>
+            {
+                token.Operation = IoOperation.Accept;
+                token.Context = null;
+            });
     }
 
     public void Start()
@@ -57,7 +72,7 @@ public sealed class GateWayServer
 
         _timeoutTimer = new Timer(CheckTimeouts, null, 1000, 1000);
         StartAccept();
-        Console.WriteLine($"Gateway listening on {_listenEp}, backend={_backendEp}");
+        Logger.Information("Gateway listening on {ListenEndPoint}, backend={BackendEndPoint}", _listenEp, _backendEp);
     }
 
     private void OnIoCompleted(object? sender, SocketAsyncEventArgs e)
@@ -77,10 +92,10 @@ public sealed class GateWayServer
                 HandleBackendRecv(e, token.Context!);
                 break;
             case IoOperation.BackendSend:
-                HandleSendCompleted(e, token.Context!, ctx => ctx.BackendSend, ctx => ctx.Backend);
+                HandleSendCompleted(e, token.Context!, ctx => ctx.BackendSend, ctx => ctx.Backend, "backend-send");
                 break;
             case IoOperation.ClientSend:
-                HandleSendCompleted(e, token.Context!, ctx => ctx.ClientSend, ctx => ctx.Client);
+                HandleSendCompleted(e, token.Context!, ctx => ctx.ClientSend, ctx => ctx.Client, "client-send");
                 break;
         }
     }
@@ -89,12 +104,20 @@ public sealed class GateWayServer
     {
         if (!_acceptPool.TryRent(out var saea))
         {
+            Logger.Debug("Accept pool exhausted, scheduling retry");
             ThreadPool.QueueUserWorkItem(_ => StartAccept());
             return;
         }
 
         saea.AcceptSocket = null;
-        saea.UserToken = new IoToken { Operation = IoOperation.Accept, Context = null };
+        if (!TryRentIoToken(saea, IoOperation.Accept, null))
+        {
+            _acceptPool.Return(saea);
+            Logger.Warning("IoToken pool exhausted for Accept, scheduling retry");
+            ThreadPool.QueueUserWorkItem(_ => StartAccept());
+            return;
+        }
+
         if (!_listen.AcceptAsync(saea))
             HandleAccept(saea);
     }
@@ -102,6 +125,7 @@ public sealed class GateWayServer
     private void HandleAccept(SocketAsyncEventArgs e)
     {
         var client = e.AcceptSocket;
+        ReturnIoToken(e);
         _acceptPool.Return(e);
 
         // Always keep accept loop hot.
@@ -117,6 +141,7 @@ public sealed class GateWayServer
             var remote = (IPEndPoint)client.RemoteEndPoint!;
             if (remote.AddressFamily != AddressFamily.InterNetwork)
             {
+                Logger.Debug("Rejected non-IPv4 client, remote={RemoteEndPoint}", remote);
                 client.Close();
                 return;
             }
@@ -124,12 +149,14 @@ public sealed class GateWayServer
             var ip = IpUtils.ToUInt32(remote.Address);
             if (_blacklist.IsBlocked(ip))
             {
+                Logger.Warning("Rejected blocked client, ip={Ip}", FormatIpv4(ip));
                 client.Close();
                 return;
             }
 
             if (!_limiter.TryAcceptConnection(ip))
             {
+                Logger.Warning("Rejected by connection rate limiter, ip={Ip}", FormatIpv4(ip));
                 client.Close();
                 return;
             }
@@ -149,7 +176,8 @@ public sealed class GateWayServer
 
             if (!TryRentConnectionSaeas(ctx))
             {
-                CloseContext(ctx, false);
+                Logger.Warning("Failed to allocate IO resources for new connection, ip={Ip}", FormatIpv4(ip));
+                CloseContext(ctx, false, "io-resources-exhausted");
                 return;
             }
 
@@ -157,11 +185,14 @@ public sealed class GateWayServer
             ctx.Id = id;
             _contexts[id] = ctx;
 
+            Logger.Debug("Connection accepted, ctxId={ContextId}, ip={Ip}, remote={RemoteEndPoint}", id, FormatIpv4(ip), remote);
+
             StartReceive(ctx.Client, ctx.ClientRecvSaea);
             StartReceive(ctx.Backend, ctx.BackendRecvSaea);
         }
-        catch
+        catch (Exception ex)
         {
+            Logger.Error(ex, "HandleAccept failed unexpectedly");
             SafeClose(client);
         }
     }
@@ -201,10 +232,43 @@ public sealed class GateWayServer
     private bool TryRentIo(ConnectionContext ctx, IoOperation op, out SocketAsyncEventArgs saea)
     {
         if (!_ioPool.TryRent(out saea!))
+        {
+            Logger.Debug("IO SAEA pool exhausted, ctxId={ContextId}, operation={Operation}", ctx.Id, op);
             return false;
+        }
 
-        saea.UserToken = new IoToken { Operation = op, Context = ctx };
+        if (!TryRentIoToken(saea, op, ctx))
+        {
+            _ioPool.Return(saea);
+            Logger.Debug("IoToken pool exhausted, ctxId={ContextId}, operation={Operation}", ctx.Id, op);
+            return false;
+        }
+
         return true;
+    }
+
+    private bool TryRentIoToken(SocketAsyncEventArgs saea, IoOperation op, ConnectionContext? ctx)
+    {
+        if (!_ioTokenPool.TryRent(out var token))
+        {
+            Logger.Warning("IoToken pool exhausted, operation={Operation}", op);
+            return false;
+        }
+
+        token.Operation = op;
+        token.Context = ctx;
+        saea.UserToken = token;
+        return true;
+    }
+
+    private void ReturnIoToken(SocketAsyncEventArgs saea)
+    {
+        if (saea.UserToken is not IoToken token)
+            return;
+
+        saea.UserToken = null;
+        token.Context = null;
+        _ioTokenPool.Return(token);
     }
 
     private void StartReceive(Socket socket, SocketAsyncEventArgs saea)
@@ -220,7 +284,9 @@ public sealed class GateWayServer
 
         if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
         {
-            CloseContext(ctx, false);
+            Logger.Debug("Client recv closed, ctxId={ContextId}, socketError={SocketError}, bytes={Bytes}",
+                ctx.Id, e.SocketError, e.BytesTransferred);
+            CloseContext(ctx, false, "client-recv-closed");
             return;
         }
 
@@ -234,8 +300,9 @@ public sealed class GateWayServer
                 ProcessClientFrames(ctx);
             }
         }
-        catch
+        catch (Exception ex)
         {
+            Logger.Warning(ex, "Client frame processing failed, ctxId={ContextId}", ctx.Id);
             RegisterInvalidPacketAndClose(ctx);
             return;
         }
@@ -274,12 +341,15 @@ public sealed class GateWayServer
             {
                 if (!McFrameParser.TryGetPacketId(frameSpan, out var pid, out _))
                 {
+                    Logger.Warning("PacketId parse failed, ctxId={ContextId}, state={State}", ctx.Id, ctx.State);
                     RegisterInvalidPacketAndClose(ctx);
                     return;
                 }
 
                 if (!StateMachine.IsAllowed(ctx.State, pid))
                 {
+                    Logger.Warning("State machine reject, ctxId={ContextId}, state={State}, packetId={PacketId}",
+                        ctx.Id, ctx.State, pid);
                     RegisterInvalidPacketAndClose(ctx);
                     return;
                 }
@@ -288,6 +358,7 @@ public sealed class GateWayServer
                 {
                     if (!McFrameParser.TryParseHandshakeNextState(frameSpan, out var next))
                     {
+                        Logger.Warning("Handshake parse failed, ctxId={ContextId}", ctx.Id);
                         RegisterInvalidPacketAndClose(ctx);
                         return;
                     }
@@ -295,28 +366,36 @@ public sealed class GateWayServer
                     if (next == 1)
                     {
                         ctx.State = ConnState.Status;
+                        Logger.Debug("State transition, ctxId={ContextId}, from={FromState}, to={ToState}",
+                            ctx.Id, ConnState.Handshake, ConnState.Status);
                     }
                     else
                     {
                         if (!TryAcquireLoginSlot(ctx))
                         {
-                            CloseContext(ctx, false);
+                            Logger.Warning("Login slot exhausted, ctxId={ContextId}, ip={Ip}", ctx.Id, FormatIpv4(ctx.IpV4));
+                            CloseContext(ctx, false, "login-slot-exhausted");
                             return;
                         }
 
                         ctx.State = ConnState.Login;
+                        Logger.Debug("State transition, ctxId={ContextId}, from={FromState}, to={ToState}",
+                            ctx.Id, ConnState.Handshake, ConnState.Login);
                     }
                 }
                 else if (ctx.State == ConnState.Login && pid == Protocol340Ids.C2S_LoginStart)
                 {
                     if (!_limiter.TryAcceptLogin(ctx.IpV4))
                     {
+                        Logger.Warning("Rejected by login rate limiter, ctxId={ContextId}, ip={Ip}", ctx.Id,
+                            FormatIpv4(ctx.IpV4));
                         RegisterInvalidPacketAndClose(ctx);
                         return;
                     }
 
                     if (!McFrameParser.TryValidateLoginStart(frameSpan))
                     {
+                        Logger.Warning("LoginStart validate failed, ctxId={ContextId}", ctx.Id);
                         RegisterInvalidPacketAndClose(ctx);
                         return;
                     }
@@ -366,7 +445,9 @@ public sealed class GateWayServer
 
         if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
         {
-            CloseContext(ctx, false);
+            Logger.Debug("Backend recv closed, ctxId={ContextId}, socketError={SocketError}, bytes={Bytes}",
+                ctx.Id, e.SocketError, e.BytesTransferred);
+            CloseContext(ctx, false, "backend-recv-closed");
             return;
         }
 
@@ -399,6 +480,8 @@ public sealed class GateWayServer
 
         ctx.State = ConnState.Play;
         ReleaseLoginSlot(ctx);
+        Logger.Information("State transition, ctxId={ContextId}, from={FromState}, to={ToState}",
+            ctx.Id, ConnState.Login, ConnState.Play);
     }
 
     private void EnqueueBackendZeroCopy(ConnectionContext ctx, ArraySegment<byte> seg1, ArraySegment<byte> seg2, int totalLen)
@@ -411,7 +494,7 @@ public sealed class GateWayServer
             FromClientInboundRing = true
         };
 
-        EnqueueSend(ctx, ctx.BackendSend, item, ctx.Backend, ctx.BackendSendSaea);
+        EnqueueSend(ctx, ctx.BackendSend, item, ctx.Backend, ctx.BackendSendSaea, "backend-send");
     }
 
     private void EnqueueClientSend(ConnectionContext ctx, byte[] rent, int len)
@@ -424,10 +507,11 @@ public sealed class GateWayServer
             Rented = rent
         };
 
-        EnqueueSend(ctx, ctx.ClientSend, item, ctx.Client, ctx.ClientSendSaea);
+        EnqueueSend(ctx, ctx.ClientSend, item, ctx.Client, ctx.ClientSendSaea, "client-send");
     }
 
-    private void EnqueueSend(ConnectionContext ctx, SendChannel channel, SendWorkItem item, Socket socket, SocketAsyncEventArgs saea)
+    private void EnqueueSend(ConnectionContext ctx, SendChannel channel, SendWorkItem item, Socket socket, SocketAsyncEventArgs saea,
+        string channelName)
     {
         bool start;
         lock (channel.Sync)
@@ -439,10 +523,10 @@ public sealed class GateWayServer
         }
 
         if (start)
-            TrySendNext(ctx, channel, socket, saea);
+            TrySendNext(ctx, channel, socket, saea, channelName);
     }
 
-    private void TrySendNext(ConnectionContext ctx, SendChannel channel, Socket socket, SocketAsyncEventArgs saea)
+    private void TrySendNext(ConnectionContext ctx, SendChannel channel, Socket socket, SocketAsyncEventArgs saea, string channelName)
     {
         while (true)
         {
@@ -479,7 +563,7 @@ public sealed class GateWayServer
             saea.SetBuffer(seg.Array!, seg.Offset, seg.Count);
             if (!socket.SendAsync(saea))
             {
-                HandleSendCompleted(saea, ctx, _ => channel, _ => socket);
+                HandleSendCompleted(saea, ctx, _ => channel, _ => socket, channelName);
                 return;
             }
 
@@ -488,14 +572,16 @@ public sealed class GateWayServer
     }
 
     private void HandleSendCompleted(SocketAsyncEventArgs e, ConnectionContext ctx, Func<ConnectionContext, SendChannel> channelSelector,
-        Func<ConnectionContext, Socket> socketSelector)
+        Func<ConnectionContext, Socket> socketSelector, string channelName)
     {
         if (ctx.Closed)
             return;
 
         if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
         {
-            CloseContext(ctx, false);
+            Logger.Debug("Send failed, ctxId={ContextId}, channel={Channel}, socketError={SocketError}, bytes={Bytes}",
+                ctx.Id, channelName, e.SocketError, e.BytesTransferred);
+            CloseContext(ctx, false, "send-failed");
             return;
         }
 
@@ -508,7 +594,8 @@ public sealed class GateWayServer
             var item = channel.Current;
             if (item == null)
             {
-                CloseContext(ctx, false);
+                Logger.Warning("Send channel invariant broken, ctxId={ContextId}, channel={Channel}", ctx.Id, channelName);
+                CloseContext(ctx, false, "send-channel-invariant");
                 return;
             }
 
@@ -519,7 +606,7 @@ public sealed class GateWayServer
             CompleteCurrentSendItem(ctx, channel);
 
         if (!ctx.Closed)
-            TrySendNext(ctx, channel, socketSelector(ctx), e);
+            TrySendNext(ctx, channel, socketSelector(ctx), e, channelName);
     }
 
     private static ArraySegment<byte> GetCurrentSegment(SendWorkItem item)
@@ -562,7 +649,7 @@ public sealed class GateWayServer
         return item.SegmentIndex > 1;
     }
 
-    private void CompleteCurrentSendItem(ConnectionContext ctx, SendChannel channel)
+    private static void CompleteCurrentSendItem(ConnectionContext ctx, SendChannel channel)
     {
         SendWorkItem? item;
         lock (channel.Sync)
@@ -620,10 +707,12 @@ public sealed class GateWayServer
     private void RegisterInvalidPacketAndClose(ConnectionContext ctx)
     {
         var count = Interlocked.Increment(ref ctx.InvalidPacketCount);
+        Logger.Warning("Invalid packet detected, ctxId={ContextId}, count={Count}, threshold={Threshold}",
+            ctx.Id, count, InvalidPacketBanThreshold);
         if (count >= InvalidPacketBanThreshold)
-            CloseContext(ctx, true);
+            CloseContext(ctx, true, "invalid-packet-threshold");
         else
-            CloseContext(ctx, false);
+            CloseContext(ctx, false, "invalid-packet");
     }
 
     private void CheckTimeouts(object? _)
@@ -645,17 +734,28 @@ public sealed class GateWayServer
 
             var delta = (now - Volatile.Read(ref ctx.LastActivityTicks)) / _ticksPerSec;
             if (delta > timeout.TotalSeconds)
-                CloseContext(ctx, false);
+            {
+                Logger.Warning("Connection timeout, ctxId={ContextId}, state={State}, elapsedSeconds={ElapsedSeconds:F2}",
+                    ctx.Id, ctx.State, delta);
+                CloseContext(ctx, false, "state-timeout");
+            }
         }
     }
 
-    private void CloseContext(ConnectionContext ctx, bool tempBan)
+    private void CloseContext(ConnectionContext ctx, bool tempBan, string reason)
     {
         if (!ctx.TryMarkClosed())
             return;
 
+        Logger.Information("Closing connection, ctxId={ContextId}, ip={Ip}, state={State}, tempBan={TempBan}, reason={Reason}",
+            ctx.Id, FormatIpv4(ctx.IpV4), ctx.State, tempBan, reason);
+
         if (tempBan)
+        {
             _blacklist.TempBan(ctx.IpV4, TempBanDuration);
+            Logger.Warning("Temporary ban applied, ip={Ip}, duration={DurationSeconds}s",
+                FormatIpv4(ctx.IpV4), TempBanDuration.TotalSeconds);
+        }
 
         ReleaseLoginSlot(ctx);
 
@@ -713,9 +813,17 @@ public sealed class GateWayServer
         }
     }
 
-    private void ReturnSaea(SocketAsyncEventArgs saea)
+    private void ReturnSaea(SocketAsyncEventArgs? saea)
     {
-        if (saea != null)
-            _ioPool.Return(saea);
+        if (saea == null)
+            return;
+
+        ReturnIoToken(saea);
+        _ioPool.Return(saea);
+    }
+
+    private static string FormatIpv4(uint ip)
+    {
+        return $"{(ip >> 24) & 0xFF}.{(ip >> 16) & 0xFF}.{(ip >> 8) & 0xFF}.{ip & 0xFF}";
     }
 }

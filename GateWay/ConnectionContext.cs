@@ -18,7 +18,7 @@ public enum IoOperation : byte
 
 public sealed class IoToken
 {
-    public required IoOperation Operation;
+    public IoOperation Operation;
     public ConnectionContext? Context;
 }
 
