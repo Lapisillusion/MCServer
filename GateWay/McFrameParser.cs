@@ -1,47 +1,44 @@
-﻿// McFrameParser.cs
-
+using System.Text;
 using Common;
 
 namespace GateWay;
 
 public static class McFrameParser
 {
-    // 最大包长：MVP 建议 2MB（你可更严）
     public const int MaxFramePayload = 2 * 1024 * 1024;
     public const int MaxStringLen = 255;
+    public const int MaxNameLen = 16;
 
-    // 尝试从 ring buffer 中解析出一帧
-    // 输出：frameBytes（包含 lengthVarInt + payload 的“原始帧”）
-    // 注意：为了高性能，这里用 caller 提供的临时缓冲（stackalloc/租借）
+    public readonly record struct HandshakePacket(int ProtocolVersion, string ServerAddress, ushort ServerPort, int NextState);
+    public readonly record struct LoginStartPacket(string Username);
+
     public static bool TryReadFrame(ByteRingBuffer rb, Span<byte> temp, out int frameLenTotal)
     {
         frameLenTotal = 0;
 
-        // 至少要 peek 5 字节以解析 VarInt(length)
         var peek = rb.Peek(temp, Math.Min(temp.Length, Math.Min(rb.Count, 5)));
-        if (peek == 0) return false;
+        if (peek == 0)
+            return false;
 
         var off = 0;
         if (!VarInt.TryRead(temp[..peek], ref off, out var payloadLen))
-            return false; // not enough or malformed
+            return false;
 
         if (payloadLen < 0 || payloadLen > MaxFramePayload)
             throw new InvalidOperationException("Payload too large");
 
-        var needTotal = off + payloadLen; // varint bytes + payload bytes
-        if (rb.Count < needTotal) return false;
+        var needTotal = off + payloadLen;
+        if (rb.Count < needTotal)
+            return false;
 
         frameLenTotal = needTotal;
         return true;
     }
 
-    // 读取 packetId（从 payload 的开头读 VarInt）
-    // frameSpan 是 "lengthVarInt + payload"；payload 从 payloadOffset 开始
     public static bool TryGetPacketId(ReadOnlySpan<byte> frameSpan, out int packetId, out int payloadOffset)
     {
-        // 先跳过 lengthVarInt
         var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen))
+        if (!VarInt.TryRead(frameSpan, ref off, out _))
         {
             packetId = 0;
             payloadOffset = 0;
@@ -49,8 +46,6 @@ public static class McFrameParser
         }
 
         payloadOffset = off;
-
-        // payload 开头读 packetId
         if (!VarInt.TryRead(frameSpan, ref off, out packetId))
         {
             packetId = 0;
@@ -58,64 +53,105 @@ public static class McFrameParser
             return false;
         }
 
-        // off 现在指向 packet fields 起点（相对于 frameSpan）
         return true;
     }
 
-    // 解析 Handshake，返回 nextState（1=Status,2=Login）
-    // frameSpan: length+payload
     public static bool TryParseHandshakeNextState(ReadOnlySpan<byte> frameSpan, out int nextState)
     {
-        nextState = 0;
+        if (!TryParseHandshake(frameSpan, out var handshake))
+        {
+            nextState = 0;
+            return false;
+        }
 
-        var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen)) return false;
-
-        // packetId
-        if (!VarInt.TryRead(frameSpan, ref off, out var pid)) return false;
-        if (pid != Protocol340Ids.C2S_Handshake) return false;
-
-        // protocolVersion
-        if (!VarInt.TryRead(frameSpan, ref off, out _)) return false;
-
-        // serverAddress (string)
-        if (!VarInt.TryRead(frameSpan, ref off, out var strLen)) return false;
-        if (strLen < 0 || strLen > MaxStringLen) return false;
-        if (off + strLen > frameSpan.Length) return false;
-        off += strLen;
-
-        // serverPort ushort
-        if (off + 2 > frameSpan.Length) return false;
-        off += 2;
-
-        // nextState varint
-        if (!VarInt.TryRead(frameSpan, ref off, out nextState)) return false;
-        if (nextState != 1 && nextState != 2) return false;
-
+        nextState = handshake.NextState;
         return true;
     }
 
-    // （可选）解析 LoginStart 的 username 做长度校验
+    public static bool TryParseHandshake(ReadOnlySpan<byte> frameSpan, out HandshakePacket handshake)
+    {
+        handshake = default;
+
+        var off = 0;
+        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen))
+            return false;
+        if (payloadLen < 0 || payloadLen > MaxFramePayload)
+            return false;
+        var payloadEnd = off + payloadLen;
+        if (payloadEnd != frameSpan.Length)
+            return false;
+
+        if (!VarInt.TryRead(frameSpan, ref off, out var pid))
+            return false;
+        if (pid != Protocol340Ids.C2S_Handshake)
+            return false;
+
+        if (!VarInt.TryRead(frameSpan, ref off, out var protocolVersion))
+            return false;
+        if (!TryReadString(frameSpan, ref off, MaxStringLen, out var serverAddress))
+            return false;
+
+        if (off + 2 > frameSpan.Length)
+            return false;
+        var serverPort = (ushort)((frameSpan[off] << 8) | frameSpan[off + 1]);
+        off += 2;
+
+        if (!VarInt.TryRead(frameSpan, ref off, out var nextState))
+            return false;
+        if (nextState is not (1 or 2))
+            return false;
+        if (off != payloadEnd)
+            return false;
+
+        handshake = new HandshakePacket(protocolVersion, serverAddress, serverPort, nextState);
+        return true;
+    }
+
     public static bool TryValidateLoginStart(ReadOnlySpan<byte> frameSpan)
     {
-        var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out _)) return false;
-        if (!VarInt.TryRead(frameSpan, ref off, out var pid)) return false;
-        if (pid != Protocol340Ids.C2S_LoginStart) return false;
+        return TryParseLoginStart(frameSpan, out _);
+    }
 
-        if (!VarInt.TryRead(frameSpan, ref off, out var nameLen)) return false;
-        if (nameLen < 1 || nameLen > 16) return false; // MC 用户名常见限制
-        if (off + nameLen > frameSpan.Length) return false;
-        // 可进一步校验字符集
+    public static bool TryParseLoginStart(ReadOnlySpan<byte> frameSpan, out LoginStartPacket loginStart)
+    {
+        loginStart = default;
+
+        var off = 0;
+        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen))
+            return false;
+        if (payloadLen < 0 || payloadLen > MaxFramePayload)
+            return false;
+        var payloadEnd = off + payloadLen;
+        if (payloadEnd != frameSpan.Length)
+            return false;
+
+        if (!VarInt.TryRead(frameSpan, ref off, out var pid))
+            return false;
+        if (pid != Protocol340Ids.C2S_LoginStart)
+            return false;
+
+        if (!TryReadString(frameSpan, ref off, MaxNameLen, out var userName))
+            return false;
+        if (userName.Length is < 1 or > MaxNameLen)
+            return false;
+        if (!IsValidPlayerName(userName))
+            return false;
+        if (off != payloadEnd)
+            return false;
+
+        loginStart = new LoginStartPacket(userName);
         return true;
     }
 
     public static bool TryIsStatusRequest(ReadOnlySpan<byte> frameSpan)
     {
         var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen)) return false;
-        if (payloadLen != 1) return false;
-        if (!VarInt.TryRead(frameSpan, ref off, out var pid)) return false;
+        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen))
+            return false;
+        if (payloadLen != 1)
+            return false;
+        if (!VarInt.TryRead(frameSpan, ref off, out var pid))
+            return false;
         return pid == Protocol340Ids.C2S_StatusRequest && off == frameSpan.Length;
     }
 
@@ -124,17 +160,51 @@ public static class McFrameParser
         payload = 0;
 
         var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen)) return false;
-        if (!VarInt.TryRead(frameSpan, ref off, out var pid)) return false;
-        if (pid != Protocol340Ids.C2S_StatusPing) return false;
-        if (payloadLen != 9) return false; // packetId(1) + long(8)
-        if (off + 8 != frameSpan.Length) return false;
+        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen))
+            return false;
+        if (!VarInt.TryRead(frameSpan, ref off, out var pid))
+            return false;
+        if (pid != Protocol340Ids.C2S_StatusPing)
+            return false;
+        if (payloadLen != 9)
+            return false;
+        if (off + 8 != frameSpan.Length)
+            return false;
 
         ulong value = 0;
         for (var i = 0; i < 8; i++)
             value = (value << 8) | frameSpan[off + i];
 
         payload = unchecked((long)value);
+        return true;
+    }
+
+    private static bool TryReadString(ReadOnlySpan<byte> src, ref int off, int maxLen, out string value)
+    {
+        value = string.Empty;
+        if (!VarInt.TryRead(src, ref off, out var strLen))
+            return false;
+        if (strLen < 0 || strLen > maxLen)
+            return false;
+        if (off + strLen > src.Length)
+            return false;
+
+        value = Encoding.UTF8.GetString(src.Slice(off, strLen));
+        off += strLen;
+        return true;
+    }
+
+    private static bool IsValidPlayerName(string name)
+    {
+        foreach (var ch in name)
+        {
+            var isDigit = ch is >= '0' and <= '9';
+            var isUpper = ch is >= 'A' and <= 'Z';
+            var isLower = ch is >= 'a' and <= 'z';
+            if (!isDigit && !isUpper && !isLower && ch != '_')
+                return false;
+        }
+
         return true;
     }
 }

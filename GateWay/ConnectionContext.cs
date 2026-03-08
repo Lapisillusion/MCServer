@@ -64,6 +64,9 @@ public sealed class ConnectionContext
     public bool LoginSlotHeld;
     public bool CloseAfterStatusPong;
     public uint IpV4;
+    public int ProtocolVersion;
+    public string? PlayerName;
+    public string? PlayerUuid;
     public int InvalidPacketCount;
     public ConnState State = ConnState.Handshake;
 

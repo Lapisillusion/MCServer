@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using Common;
@@ -29,6 +30,12 @@ public sealed class GateWayServer
     private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan LoginTimeout = TimeSpan.FromSeconds(5);
     private const string StatusResponseFileName = "status-response.json";
+    private static readonly HashSet<string> ReservedNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "server",
+        "console",
+        "system"
+    };
     private static readonly byte[] StatusResponseFrame = BuildStatusResponseFrame();
 
     private readonly IPEndPoint _backendEp;
@@ -313,7 +320,6 @@ public sealed class GateWayServer
         if (!ctx.Closed)
             StartReceive(ctx.Client, e);
     }
-
     private void ProcessClientFrames(ConnectionContext ctx)
     {
         Span<byte> peek5 = stackalloc byte[5];
@@ -340,33 +346,57 @@ public sealed class GateWayServer
                 frameSpan = parseRent.AsSpan(0, frameLen);
             }
 
+            var stateBefore = ctx.State;
+            var forwardToBackend = stateBefore == ConnState.Play;
+            object? parsed = null;
+
             try
             {
-                if (!McFrameParser.TryGetPacketId(frameSpan, out var pid, out _))
+                if (!McFrameParser.TryGetPacketId(frameSpan, out var pid, out var payloadOffset))
                 {
                     Logger.Warning("PacketId parse failed, ctxId={ContextId}, state={State}", ctx.Id, ctx.State);
                     RegisterInvalidPacketAndClose(ctx);
                     return;
                 }
 
-                if (!StateMachine.IsAllowed(ctx.State, pid))
+                var payloadLen = frameLen - payloadOffset;
+                if (!StateMachine.IsAllowed(stateBefore, pid))
                 {
                     Logger.Warning("State machine reject, ctxId={ContextId}, state={State}, packetId={PacketId}",
-                        ctx.Id, ctx.State, pid);
+                        ctx.Id, stateBefore, pid);
                     RegisterInvalidPacketAndClose(ctx);
                     return;
                 }
 
-                if (ctx.State == ConnState.Handshake && pid == Protocol340Ids.C2S_Handshake)
+                if (stateBefore == ConnState.Handshake && pid == Protocol340Ids.C2S_Handshake)
                 {
-                    if (!McFrameParser.TryParseHandshakeNextState(frameSpan, out var next))
+                    if (!McFrameParser.TryParseHandshake(frameSpan, out var handshake))
                     {
                         Logger.Warning("Handshake parse failed, ctxId={ContextId}", ctx.Id);
                         RegisterInvalidPacketAndClose(ctx);
                         return;
                     }
 
-                    if (next == 1)
+                    if (handshake.ProtocolVersion != Protocol340Ids.ProtocolVersion)
+                    {
+                        Logger.Warning("Protocol version reject, ctxId={ContextId}, protocolVersion={ProtocolVersion}, expected={Expected}",
+                            ctx.Id, handshake.ProtocolVersion, Protocol340Ids.ProtocolVersion);
+                        RegisterInvalidPacketAndClose(ctx);
+                        return;
+                    }
+
+                    ctx.ProtocolVersion = handshake.ProtocolVersion;
+                    parsed = new
+                    {
+                        PacketType = "Handshake",
+                        handshake.ProtocolVersion,
+                        handshake.ServerAddress,
+                        handshake.ServerPort,
+                        handshake.NextState
+                    };
+                    forwardToBackend = false;
+
+                    if (handshake.NextState == 1)
                     {
                         ctx.State = ConnState.Status;
                         Logger.Debug("State transition, ctxId={ContextId}, from={FromState}, to={ToState}",
@@ -386,11 +416,10 @@ public sealed class GateWayServer
                             ctx.Id, ConnState.Handshake, ConnState.Login);
                     }
                 }
-                else if (ctx.State == ConnState.Status)
+                else if (stateBefore == ConnState.Status)
                 {
                     if (pid == Protocol340Ids.C2S_StatusRequest)
                     {
-                        
                         if (!McFrameParser.TryIsStatusRequest(frameSpan))
                         {
                             Logger.Warning("StatusRequest validate failed, ctxId={ContextId}", ctx.Id);
@@ -398,7 +427,8 @@ public sealed class GateWayServer
                             return;
                         }
 
-                        Logger.Information("接收到Status--Request请求");
+                        parsed = new { PacketType = "StatusRequest" };
+                        forwardToBackend = false;
                         SendStatusResponse(ctx);
                     }
                     else if (pid == Protocol340Ids.C2S_StatusPing)
@@ -409,11 +439,13 @@ public sealed class GateWayServer
                             RegisterInvalidPacketAndClose(ctx);
                             return;
                         }
-                        Logger.Information("接收到Status--Ping请求");
+
+                        parsed = new { PacketType = "StatusPing", Payload = payload };
+                        forwardToBackend = false;
                         SendStatusPongAndClose(ctx, payload);
                     }
                 }
-                else if (ctx.State == ConnState.Login && pid == Protocol340Ids.C2S_LoginStart)
+                else if (stateBefore == ConnState.Login && pid == Protocol340Ids.C2S_LoginStart)
                 {
                     if (!_limiter.TryAcceptLogin(ctx.IpV4))
                     {
@@ -423,38 +455,55 @@ public sealed class GateWayServer
                         return;
                     }
 
-                    if (!McFrameParser.TryValidateLoginStart(frameSpan))
+                    if (!McFrameParser.TryParseLoginStart(frameSpan, out var loginStart))
                     {
                         Logger.Warning("LoginStart validate failed, ctxId={ContextId}", ctx.Id);
                         RegisterInvalidPacketAndClose(ctx);
                         return;
                     }
+
+                    if (ReservedNames.Contains(loginStart.Username))
+                    {
+                        Logger.Warning("Rejected reserved player name, ctxId={ContextId}, name={PlayerName}", ctx.Id, loginStart.Username);
+                        RegisterInvalidPacketAndClose(ctx);
+                        return;
+                    }
+
+                    ctx.PlayerName = loginStart.Username;
+                    var uuid = BuildOfflinePlayerUuid(loginStart.Username);
+                    ctx.PlayerUuid = uuid;
+                    parsed = new
+                    {
+                        PacketType = "LoginStart",
+                        PlayerName = loginStart.Username,
+                        PlayerUuid = uuid
+                    };
+                    forwardToBackend = false;
+
+                    SendLoginSuccessAndPromote(ctx, loginStart.Username, uuid);
                 }
+
+                LogParsedClientPacket(ctx, stateBefore, pid, frameLen, payloadLen, parsed, forwardToBackend);
+
+                ctx.ParsedClientBytes += frameLen;
+                if (!forwardToBackend)
+                {
+                    ctx.ClientInbound.Skip(frameLen);
+                    ctx.ParsedClientBytes -= frameLen;
+                    if (ctx.ParsedClientBytes < 0)
+                        ctx.ParsedClientBytes = 0;
+                    continue;
+                }
+
+                EnqueueBackendZeroCopy(ctx, seg1, seg2, frameLen);
             }
             finally
             {
                 if (parseRent != null)
                     ArrayPool<byte>.Shared.Return(parseRent);
             }
-
-            ctx.ParsedClientBytes += frameLen;
-            if (ctx.State == ConnState.Status)
-            {
-                lock (ctx.ParserSync)
-                {
-                    ctx.ClientInbound.Skip(frameLen);
-                    ctx.ParsedClientBytes -= frameLen;
-                    if (ctx.ParsedClientBytes < 0)
-                        ctx.ParsedClientBytes = 0;
-                }
-
-                continue;
-            }
-
-            EnqueueBackendZeroCopy(ctx, seg1, seg2, frameLen);
         }
     }
-
     private bool TryReadClientFrame(ConnectionContext ctx, Span<byte> temp, out int frameLenTotal)
     {
         frameLenTotal = 0;
@@ -495,7 +544,14 @@ public sealed class GateWayServer
         }
 
         ctx.LastActivityTicks = Stopwatch.GetTimestamp();
-        TryPromoteLoginToPlay(ctx, e.Buffer.AsSpan(e.Offset, e.BytesTransferred));
+        if (ctx.State != ConnState.Play)
+        {
+            Logger.Debug("Drop backend packet before play, ctxId={ContextId}, state={State}, bytes={Bytes}",
+                ctx.Id, ctx.State, e.BytesTransferred);
+            if (!ctx.Closed)
+                StartReceive(ctx.Backend, e);
+            return;
+        }
 
         var rent = ArrayPool<byte>.Shared.Rent(e.BytesTransferred);
         Buffer.BlockCopy(e.Buffer!, e.Offset, rent, 0, e.BytesTransferred);
@@ -506,25 +562,77 @@ public sealed class GateWayServer
             StartReceive(ctx.Backend, e);
     }
 
-    private void TryPromoteLoginToPlay(ConnectionContext ctx, ReadOnlySpan<byte> data)
+    private void SendLoginSuccessAndPromote(ConnectionContext ctx, string playerName, string playerUuid)
     {
         if (ctx.State != ConnState.Login)
             return;
 
-        var off = 0;
-        if (!VarInt.TryRead(data, ref off, out _))
-            return;
+        var frame = BuildLoginSuccessFrame(playerUuid, playerName);
+        var item = new SendWorkItem
+        {
+            Segment1 = new ArraySegment<byte>(frame, 0, frame.Length),
+            Segment2 = default,
+            TotalLength = frame.Length
+        };
 
-        if (!VarInt.TryRead(data, ref off, out var packetId))
-            return;
-
-        if (packetId != Protocol340Ids.S2C_LoginSuccess)
-            return;
-
+        EnqueueSend(ctx, ctx.ClientSend, item, ctx.Client, ctx.ClientSendSaea, "client-send");
         ctx.State = ConnState.Play;
         ReleaseLoginSlot(ctx);
-        Logger.Information("State transition, ctxId={ContextId}, from={FromState}, to={ToState}",
-            ctx.Id, ConnState.Login, ConnState.Play);
+        Logger.Information("State transition, ctxId={ContextId}, from={FromState}, to={ToState}, playerName={PlayerName}, playerUuid={PlayerUuid}",
+            ctx.Id, ConnState.Login, ConnState.Play, playerName, playerUuid);
+    }
+
+    private static string BuildOfflinePlayerUuid(string playerName)
+    {
+        var hash = MD5.HashData(Encoding.UTF8.GetBytes($"OfflinePlayer:{playerName}"));
+        hash[6] = (byte)((hash[6] & 0x0F) | 0x30); // version 3
+        hash[8] = (byte)((hash[8] & 0x3F) | 0x80); // IETF variant
+        return (Convert.ToHexString(hash.AsSpan(0, 4)) + "-"
+               + Convert.ToHexString(hash.AsSpan(4, 2)) + "-"
+               + Convert.ToHexString(hash.AsSpan(6, 2)) + "-"
+               + Convert.ToHexString(hash.AsSpan(8, 2)) + "-"
+               + Convert.ToHexString(hash.AsSpan(10, 6))).ToLowerInvariant();
+    }
+
+    private static byte[] BuildLoginSuccessFrame(string playerUuid, string playerName)
+    {
+        var uuidBytes = Encoding.UTF8.GetBytes(playerUuid.ToLowerInvariant());
+        var nameBytes = Encoding.UTF8.GetBytes(playerName);
+        Span<byte> varIntBuf = stackalloc byte[5];
+
+        var uuidLenVarInt = VarInt.Write(varIntBuf, uuidBytes.Length);
+        var nameLenVarInt = VarInt.Write(varIntBuf, nameBytes.Length);
+        var payloadLen = 1 + uuidLenVarInt + uuidBytes.Length + nameLenVarInt + nameBytes.Length;
+        var frameLenVarInt = VarInt.Write(varIntBuf, payloadLen);
+
+        var frame = new byte[frameLenVarInt + payloadLen];
+        var offset = 0;
+        offset += VarInt.Write(frame.AsSpan(offset), payloadLen);
+        offset += VarInt.Write(frame.AsSpan(offset), Protocol340Ids.S2C_LoginSuccess);
+        offset += VarInt.Write(frame.AsSpan(offset), uuidBytes.Length);
+        uuidBytes.CopyTo(frame.AsSpan(offset));
+        offset += uuidBytes.Length;
+        offset += VarInt.Write(frame.AsSpan(offset), nameBytes.Length);
+        nameBytes.CopyTo(frame.AsSpan(offset));
+        return frame;
+    }
+
+    private void LogParsedClientPacket(ConnectionContext ctx, ConnState stateBefore, int packetId, int frameLen, int payloadLen,
+        object? parsed, bool forwardToBackend)
+    {
+        var result = new
+        {
+            Direction = "client->gateway",
+            ContextId = ctx.Id,
+            State = stateBefore.ToString(),
+            PacketId = $"0x{packetId:X2}",
+            FrameLength = frameLen,
+            PayloadLength = payloadLen,
+            ForwardToBackend = forwardToBackend,
+            Parsed = parsed
+        };
+
+        Logger.Information("Parsed packet {@Packet}", result);
     }
 
     private void EnqueueBackendZeroCopy(ConnectionContext ctx, ArraySegment<byte> seg1, ArraySegment<byte> seg2, int totalLen)
@@ -979,4 +1087,5 @@ public sealed class GateWayServer
         return frame;
     }
 }
+
 
