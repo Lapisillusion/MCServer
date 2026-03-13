@@ -1,4 +1,3 @@
-using System.Net;
 using GateWay;
 using Serilog;
 using Serilog.Events;
@@ -24,8 +23,7 @@ public class GateWayStarter
 
         try
         {
-            var listen = new IPEndPoint(IPAddress.Any, 25565);
-            var backend = new IPEndPoint(IPAddress.Parse("127.0.0.1"), 25566);
+            var options = GateWayOptions.CreateDefault();
 
             var blacklist = new Blacklist();
             // blacklist.AddIp("1.2.3.4");
@@ -33,7 +31,10 @@ public class GateWayStarter
 
             var limiter = new RateLimiter();
 
-            var server = new GateWayServer(listen, backend, blacklist, limiter);
+            Log.Information("Gateway boot options: listen={Listen}, gameServer={GameServer}",
+                options.ListenEndPoint, options.GameServerEndPoint);
+
+            var server = new GateWayServer(options, blacklist, limiter);
             server.Start();
 
             Log.Information("Press Enter to quit.");

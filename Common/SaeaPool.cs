@@ -5,7 +5,7 @@ using System.Net.Sockets;
 
 namespace Common;
 
-public sealed class SaeaPool
+public sealed class SaeaPool : IDisposable
 {
     private readonly ConcurrentBag<SocketAsyncEventArgs> _bag = new();
     private readonly int _bufferSize;
@@ -83,7 +83,14 @@ public sealed class SaeaPool
         {
             // 回收时若该 SAEA 仍有异步操作在途，直接丢弃并释放池容量，
             // 让后续 TryRent 按需补建，避免进程被并发回收竞态打崩。
+            saea.Dispose();
             Interlocked.Decrement(ref _created);
         }
+    }
+
+    public void Dispose()
+    {
+        while (_bag.TryTake(out var saea))
+            saea.Dispose();
     }
 }

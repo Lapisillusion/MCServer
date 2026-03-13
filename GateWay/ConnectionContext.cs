@@ -50,11 +50,11 @@ public sealed class ConnectionContext
     public readonly SendChannel ClientSend = new();
     public readonly object ParserSync = new();
 
-    public Socket Backend = null!;
+    public Socket? Backend;
     public Socket Client = null!;
 
-    public SocketAsyncEventArgs BackendRecvSaea = null!;
-    public SocketAsyncEventArgs BackendSendSaea = null!;
+    public SocketAsyncEventArgs? BackendRecvSaea;
+    public SocketAsyncEventArgs? BackendSendSaea;
     public SocketAsyncEventArgs ClientRecvSaea = null!;
     public SocketAsyncEventArgs ClientSendSaea = null!;
 
@@ -63,12 +63,15 @@ public sealed class ConnectionContext
     public int ParsedClientBytes;
     public bool LoginSlotHeld;
     public bool CloseAfterStatusPong;
+    public bool CloseAfterLoginDisconnect;
     public uint IpV4;
     public int ProtocolVersion;
     public string? PlayerName;
     public string? PlayerUuid;
     public int InvalidPacketCount;
     public ConnState State = ConnState.Handshake;
+
+    public bool HasBackend => Backend != null && BackendRecvSaea != null && BackendSendSaea != null;
 
     public bool Closed => Volatile.Read(ref _closed) != 0;
 

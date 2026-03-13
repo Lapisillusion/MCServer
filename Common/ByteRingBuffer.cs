@@ -9,6 +9,7 @@ public sealed class ByteRingBuffer
     private byte[] _buf;
     private int _r; // read index
     private int _w; // write index
+    private int _disposed;
 
     public ByteRingBuffer(int initialCapacity = 64 * 1024)
     {
@@ -21,13 +22,19 @@ public sealed class ByteRingBuffer
 
     public void Dispose()
     {
-        ArrayPool<byte>.Shared.Return(_buf);
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        if (_buf.Length > 0)
+            ArrayPool<byte>.Shared.Return(_buf);
+
         _buf = Array.Empty<byte>();
         _r = _w = Count = 0;
     }
 
     public void EnsureWriteCapacity(int need)
     {
+        ThrowIfDisposed();
         if (need <= Capacity - Count) return;
 
         var newCap = Capacity;
@@ -57,6 +64,7 @@ public sealed class ByteRingBuffer
 
     public void Write(ReadOnlySpan<byte> src)
     {
+        ThrowIfDisposed();
         EnsureWriteCapacity(src.Length);
 
         var first = Math.Min(src.Length, Capacity - _w);
@@ -82,6 +90,7 @@ public sealed class ByteRingBuffer
     // Peek at an offset from the current read index without consuming.
     public int PeekAt(int offset, Span<byte> dst, int len)
     {
+        ThrowIfDisposed();
         if (offset < 0 || offset > Count)
             return 0;
 
@@ -102,6 +111,7 @@ public sealed class ByteRingBuffer
     // Get up to two readable segments for zero-copy send.
     public bool TryGetReadSegments(int offset, int len, out ArraySegment<byte> first, out ArraySegment<byte> second)
     {
+        ThrowIfDisposed();
         first = default;
         second = default;
 
@@ -126,9 +136,16 @@ public sealed class ByteRingBuffer
 
     public void Skip(int len)
     {
+        ThrowIfDisposed();
         len = Math.Min(len, Count);
         _r = (_r + len) % Capacity;
         Count -= len;
         if (Count == 0) _r = _w; // normalize
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(ByteRingBuffer));
     }
 }

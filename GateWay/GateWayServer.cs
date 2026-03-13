@@ -38,7 +38,7 @@ public sealed class GateWayServer
     };
     private static readonly byte[] StatusResponseFrame = BuildStatusResponseFrame();
 
-    private readonly IPEndPoint _backendEp;
+    private readonly IPEndPoint _gameServerEp;
     private readonly Blacklist _blacklist;
     private readonly RateLimiter _limiter;
     private readonly IPEndPoint _listenEp;
@@ -53,10 +53,10 @@ public sealed class GateWayServer
     private int _nextContextId;
     private Timer? _timeoutTimer;
 
-    public GateWayServer(IPEndPoint listenEp, IPEndPoint backendEp, Blacklist blacklist, RateLimiter limiter)
+    public GateWayServer(GateWayOptions options, Blacklist blacklist, RateLimiter limiter)
     {
-        _listenEp = listenEp;
-        _backendEp = backendEp;
+        _listenEp = options.ListenEndPoint;
+        _gameServerEp = options.GameServerEndPoint;
         _blacklist = blacklist;
         _limiter = limiter;
 
@@ -82,7 +82,8 @@ public sealed class GateWayServer
 
         _timeoutTimer = new Timer(CheckTimeouts, null, 1000, 1000);
         StartAccept();
-        Logger.Information("Gateway listening on {ListenEndPoint}, backend={BackendEndPoint}", _listenEp, _backendEp);
+        Logger.Information("Gateway listening on {ListenEndPoint}, fixed GameServer backend={BackendEndPoint}", _listenEp,
+            _gameServerEp);
     }
 
     private void OnIoCompleted(object? sender, SocketAsyncEventArgs e)
@@ -102,7 +103,7 @@ public sealed class GateWayServer
                 HandleBackendRecv(e, token.Context!);
                 break;
             case IoOperation.BackendSend:
-                HandleSendCompleted(e, token.Context!, ctx => ctx.BackendSend, ctx => ctx.Backend, "backend-send");
+                HandleSendCompleted(e, token.Context!, ctx => ctx.BackendSend, GetBackendSocketOrThrow, "backend-send");
                 break;
             case IoOperation.ClientSend:
                 HandleSendCompleted(e, token.Context!, ctx => ctx.ClientSend, ctx => ctx.Client, "client-send");
@@ -171,14 +172,9 @@ public sealed class GateWayServer
                 return;
             }
 
-            var backend = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            backend.NoDelay = true;
-            backend.Connect(_backendEp);
-
             var ctx = new ConnectionContext
             {
                 Client = client,
-                Backend = backend,
                 IpV4 = ip,
                 State = ConnState.Handshake,
                 LastActivityTicks = Stopwatch.GetTimestamp()
@@ -198,7 +194,6 @@ public sealed class GateWayServer
             Logger.Debug("Connection accepted, ctxId={ContextId}, ip={Ip}, remote={RemoteEndPoint}", id, FormatIpv4(ip), remote);
 
             StartReceive(ctx.Client, ctx.ClientRecvSaea);
-            StartReceive(ctx.Backend, ctx.BackendRecvSaea);
         }
         catch (Exception ex)
         {
@@ -211,32 +206,79 @@ public sealed class GateWayServer
     {
         if (!TryRentIo(ctx, IoOperation.ClientRecv, out var cRecv))
             return false;
-        if (!TryRentIo(ctx, IoOperation.BackendRecv, out var bRecv))
-        {
-            _ioPool.Return(cRecv);
-            return false;
-        }
-
-        if (!TryRentIo(ctx, IoOperation.BackendSend, out var bSend))
-        {
-            _ioPool.Return(cRecv);
-            _ioPool.Return(bRecv);
-            return false;
-        }
 
         if (!TryRentIo(ctx, IoOperation.ClientSend, out var cSend))
         {
             _ioPool.Return(cRecv);
-            _ioPool.Return(bRecv);
-            _ioPool.Return(bSend);
             return false;
         }
 
         ctx.ClientRecvSaea = cRecv;
-        ctx.BackendRecvSaea = bRecv;
-        ctx.BackendSendSaea = bSend;
         ctx.ClientSendSaea = cSend;
         return true;
+    }
+
+    private bool TryAttachGameServerBackend(ConnectionContext ctx, out string failReason)
+    {
+        failReason = string.Empty;
+        if (ctx.HasBackend)
+            return true;
+
+        Socket? backend = null;
+        try
+        {
+            backend = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            backend.NoDelay = true;
+            backend.Connect(_gameServerEp);
+
+            if (!TryRentIo(ctx, IoOperation.BackendRecv, out var backendRecv))
+            {
+                failReason = "backend-recv-io-exhausted";
+                SafeClose(backend);
+                return false;
+            }
+
+            if (!TryRentIo(ctx, IoOperation.BackendSend, out var backendSend))
+            {
+                ReturnSaea(backendRecv);
+                failReason = "backend-send-io-exhausted";
+                SafeClose(backend);
+                return false;
+            }
+
+            ctx.Backend = backend;
+            ctx.BackendRecvSaea = backendRecv;
+            ctx.BackendSendSaea = backendSend;
+
+            StartReceive(backend, backendRecv);
+            Logger.Debug("GameServer backend attached, ctxId={ContextId}, backend={Backend}",
+                ctx.Id, _gameServerEp);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning(ex, "GameServer backend connect failed, ctxId={ContextId}, backend={Backend}",
+                ctx.Id, _gameServerEp);
+
+            if (backend != null)
+                SafeClose(backend);
+
+            if (ctx.BackendRecvSaea != null)
+            {
+                ReturnSaea(ctx.BackendRecvSaea);
+                ctx.BackendRecvSaea = null;
+            }
+
+            if (ctx.BackendSendSaea != null)
+            {
+                ReturnSaea(ctx.BackendSendSaea);
+                ctx.BackendSendSaea = null;
+            }
+
+            ctx.Backend = null;
+            failReason = "backend-connect-failed";
+            return false;
+        }
     }
 
     private bool TryRentIo(ConnectionContext ctx, IoOperation op, out SocketAsyncEventArgs saea)
@@ -480,6 +522,14 @@ public sealed class GateWayServer
                     };
                     forwardToBackend = false;
 
+                    if (!TryAttachGameServerBackend(ctx, out var failReason))
+                    {
+                        SendLoginDisconnectAndClose(ctx, "GameServer is unavailable, please retry.");
+                        Logger.Warning("Login rejected due backend unavailable, ctxId={ContextId}, reason={Reason}", ctx.Id,
+                            failReason);
+                        return;
+                    }
+
                     SendLoginSuccessAndPromote(ctx, loginStart.Username, uuid);
                 }
 
@@ -534,6 +584,13 @@ public sealed class GateWayServer
     {
         if (ctx.Closed)
             return;
+        var backend = ctx.Backend;
+        if (backend == null)
+        {
+            Logger.Warning("Backend recv callback without backend socket, ctxId={ContextId}", ctx.Id);
+            CloseContext(ctx, false, "backend-missing");
+            return;
+        }
 
         if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
         {
@@ -549,7 +606,7 @@ public sealed class GateWayServer
             Logger.Debug("Drop backend packet before play, ctxId={ContextId}, state={State}, bytes={Bytes}",
                 ctx.Id, ctx.State, e.BytesTransferred);
             if (!ctx.Closed)
-                StartReceive(ctx.Backend, e);
+                StartReceive(backend, e);
             return;
         }
 
@@ -559,13 +616,19 @@ public sealed class GateWayServer
         EnqueueClientSend(ctx, rent, e.BytesTransferred);
 
         if (!ctx.Closed)
-            StartReceive(ctx.Backend, e);
+            StartReceive(backend, e);
     }
 
     private void SendLoginSuccessAndPromote(ConnectionContext ctx, string playerName, string playerUuid)
     {
         if (ctx.State != ConnState.Login)
             return;
+        if (!ctx.HasBackend)
+        {
+            Logger.Warning("Cannot promote login without backend attached, ctxId={ContextId}", ctx.Id);
+            SendLoginDisconnectAndClose(ctx, "GameServer is unavailable, please retry.");
+            return;
+        }
 
         var frame = BuildLoginSuccessFrame(playerUuid, playerName);
         var item = new SendWorkItem
@@ -617,6 +680,49 @@ public sealed class GateWayServer
         return frame;
     }
 
+    private void SendLoginDisconnectAndClose(ConnectionContext ctx, string reason)
+    {
+        if (ctx.Closed)
+            return;
+
+        var frame = BuildLoginDisconnectFrame(reason);
+        var item = new SendWorkItem
+        {
+            Segment1 = new ArraySegment<byte>(frame, 0, frame.Length),
+            Segment2 = default,
+            TotalLength = frame.Length
+        };
+
+        ctx.CloseAfterLoginDisconnect = true;
+        EnqueueSend(ctx, ctx.ClientSend, item, ctx.Client, ctx.ClientSendSaea, "client-send");
+    }
+
+    private static byte[] BuildLoginDisconnectFrame(string reason)
+    {
+        var reasonJson = $"{{\"text\":\"{EscapeJson(reason)}\"}}";
+        var reasonBytes = Encoding.UTF8.GetBytes(reasonJson);
+        Span<byte> varIntBuf = stackalloc byte[5];
+
+        var reasonLenVarInt = VarInt.Write(varIntBuf, reasonBytes.Length);
+        var payloadLen = 1 + reasonLenVarInt + reasonBytes.Length;
+        var frameLenVarInt = VarInt.Write(varIntBuf, payloadLen);
+
+        var frame = new byte[frameLenVarInt + payloadLen];
+        var offset = 0;
+        offset += VarInt.Write(frame.AsSpan(offset), payloadLen);
+        offset += VarInt.Write(frame.AsSpan(offset), Protocol340Ids.S2C_LoginDisconnect);
+        offset += VarInt.Write(frame.AsSpan(offset), reasonBytes.Length);
+        reasonBytes.CopyTo(frame.AsSpan(offset));
+        return frame;
+    }
+
+    private static string EscapeJson(string text)
+    {
+        return text
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+    }
+
     private void LogParsedClientPacket(ConnectionContext ctx, ConnState stateBefore, int packetId, int frameLen, int payloadLen,
         object? parsed, bool forwardToBackend)
     {
@@ -637,6 +743,13 @@ public sealed class GateWayServer
 
     private void EnqueueBackendZeroCopy(ConnectionContext ctx, ArraySegment<byte> seg1, ArraySegment<byte> seg2, int totalLen)
     {
+        if (!ctx.HasBackend)
+        {
+            Logger.Warning("Drop forward packet because backend is not attached, ctxId={ContextId}", ctx.Id);
+            CloseContext(ctx, false, "backend-not-attached");
+            return;
+        }
+
         var item = new SendWorkItem
         {
             Segment1 = seg1,
@@ -645,7 +758,7 @@ public sealed class GateWayServer
             FromClientInboundRing = true
         };
 
-        EnqueueSend(ctx, ctx.BackendSend, item, ctx.Backend, ctx.BackendSendSaea, "backend-send");
+        EnqueueSend(ctx, ctx.BackendSend, item, GetBackendSocketOrThrow(ctx), GetBackendSendSaeaOrThrow(ctx), "backend-send");
     }
 
     private void EnqueueClientSend(ConnectionContext ctx, byte[] rent, int len)
@@ -759,6 +872,11 @@ public sealed class GateWayServer
         if (finished && ReferenceEquals(channel, ctx.ClientSend) && ctx.CloseAfterStatusPong)
         {
             CloseContext(ctx, false, "status-pong-sent");
+            return;
+        }
+        if (finished && ReferenceEquals(channel, ctx.ClientSend) && ctx.CloseAfterLoginDisconnect)
+        {
+            CloseContext(ctx, false, "login-disconnect-sent");
             return;
         }
 
@@ -924,16 +1042,22 @@ public sealed class GateWayServer
 
         ReturnSaea(ctx.ClientRecvSaea);
         ReturnSaea(ctx.BackendRecvSaea);
+        ctx.BackendRecvSaea = null;
         ReturnSaea(ctx.BackendSendSaea);
+        ctx.BackendSendSaea = null;
         ReturnSaea(ctx.ClientSendSaea);
+        ctx.Backend = null;
 
         ctx.ClientInbound.Dispose();
 
         _contexts.TryRemove(ctx.Id, out _);
     }
 
-    private static void SafeClose(Socket socket)
+    private static void SafeClose(Socket? socket)
     {
+        if (socket == null)
+            return;
+
         try
         {
             socket.Shutdown(SocketShutdown.Both);
@@ -977,6 +1101,22 @@ public sealed class GateWayServer
 
         ReturnIoToken(saea);
         _ioPool.Return(saea);
+    }
+
+    private static Socket GetBackendSocketOrThrow(ConnectionContext ctx)
+    {
+        if (ctx.Backend == null)
+            throw new InvalidOperationException("Backend socket is not attached.");
+
+        return ctx.Backend;
+    }
+
+    private static SocketAsyncEventArgs GetBackendSendSaeaOrThrow(ConnectionContext ctx)
+    {
+        if (ctx.BackendSendSaea == null)
+            throw new InvalidOperationException("Backend send SAEA is not attached.");
+
+        return ctx.BackendSendSaea;
     }
 
     private static string FormatIpv4(uint ip)

@@ -1,0 +1,29 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <Folder Include="Application\" />
+      <Folder Include="Combat\" />
+      <Folder Include="Core\" />
+      <Folder Include="docs\" />
+      <Folder Include="Entities\" />
+      <Folder Include="Interactions\" />
+      <Folder Include="Inventory\" />
+      <Folder Include="Movement\" />
+      <Folder Include="Network\" />
+      <Folder Include="Persistence\" />
+      <Folder Include="Players\" />
+      <Folder Include="Replication\" />
+      <Folder Include="Rules\" />
+      <Folder Include="tests\" />
+      <Folder Include="Tick\" />
+      <Folder Include="World\" />
+    </ItemGroup>
+
+</Project>
