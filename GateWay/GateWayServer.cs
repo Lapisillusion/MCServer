@@ -250,7 +250,9 @@ public sealed class GateWayServer
             ctx.BackendRecvSaea = backendRecv;
             ctx.BackendSendSaea = backendSend;
 
-            StartReceive(backend, backendRecv);
+            // Defer StartReceive until state transitions to Play in SendLoginSuccessAndPromote.
+            // If we start receiving now, any data that arrives before the state transition
+            // will be dropped by HandleBackendRecv's pre-Play guard.
             Logger.Debug("GameServer backend attached, ctxId={ContextId}, backend={Backend}",
                 ctx.Id, _gameServerEp);
             return true;
@@ -640,6 +642,10 @@ public sealed class GateWayServer
 
         EnqueueSend(ctx, ctx.ClientSend, item, ctx.Client, ctx.ClientSendSaea, "client-send");
         ctx.State = ConnState.Play;
+
+        // Start receiving from backend now that we're in Play state.
+        StartReceive(ctx.Backend!, ctx.BackendRecvSaea!);
+
         ReleaseLoginSlot(ctx);
         Logger.Information("State transition, ctxId={ContextId}, from={FromState}, to={ToState}, playerName={PlayerName}, playerUuid={PlayerUuid}",
             ctx.Id, ConnState.Login, ConnState.Play, playerName, playerUuid);

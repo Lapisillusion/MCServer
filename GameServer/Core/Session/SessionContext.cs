@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using GameServer.Core.Dispatch;
+using GameServer.Players;
 
 namespace GameServer.Core.Session;
 
@@ -23,6 +24,18 @@ public sealed class SessionContext
     public DateTime CreatedUtc { get; }
     public DateTime LastActivityUtc { get; private set; }
     public bool Closed => Volatile.Read(ref _closed) != 0;
+
+    public NetworkStream? Stream { get; set; }
+    public PlayerContext? Player { get; set; }
+
+    public async Task SendFrameAsync(byte[] frame, CancellationToken ct = default)
+    {
+        if (Stream == null)
+            throw new InvalidOperationException("Session stream is not set.");
+
+        await Stream.WriteAsync(frame, ct);
+        await Stream.FlushAsync(ct);
+    }
 
     public void Touch() => LastActivityUtc = DateTime.UtcNow;
 

@@ -5,6 +5,8 @@ using GameServer.Application;
 using GameServer.Core.Diagnostics;
 using GameServer.Core.Dispatch;
 using GameServer.Core.Session;
+using GameServer.Network;
+using GameServer.Players;
 
 namespace GameServer.Network.Backend;
 
@@ -85,6 +87,10 @@ public sealed class BackendGatewayServer
         try
         {
             using var stream = new NetworkStream(session.Socket, ownsSocket: false);
+            session.Stream = stream;
+
+            await SendJoinSequenceAsync(session, cancellationToken);
+
             while (!cancellationToken.IsCancellationRequested && !session.Closed)
             {
                 var frame = await McPlayFrameCodec.ReadFrameAsync(stream, cancellationToken);
@@ -165,6 +171,40 @@ public sealed class BackendGatewayServer
         catch
         {
         }
+    }
+
+    private static async Task SendJoinSequenceAsync(SessionContext session, CancellationToken ct)
+    {
+        var player = new PlayerContext
+        {
+            EntityId = 0,
+            Gamemode = 0, // Survival
+            Dimension = 0, // Overworld
+            X = 0.5,
+            Y = 4.0,
+            Z = 0.5,
+            Yaw = 0f,
+            Pitch = 0f,
+            TeleportId = 1
+        };
+        session.Player = player;
+
+        var frames = new[]
+        {
+            S2CPacketBuilders.BuildJoinGame(player.EntityId, player.Gamemode, player.Dimension,
+                difficulty: 2, maxPlayers: 0, levelType: "flat", reducedDebugInfo: false),
+            S2CPacketBuilders.BuildPluginMessage("MC|Brand", "vanilla"),
+            S2CPacketBuilders.BuildServerDifficulty(difficulty: 2),
+            S2CPacketBuilders.BuildPlayerAbilities(flags: 0, flyingSpeed: 0.05f, walkingSpeed: 0.1f),
+            S2CPacketBuilders.BuildSpawnPosition(0, 4, 0),
+            S2CPacketBuilders.BuildPlayerPositionAndLook(player.X, player.Y, player.Z,
+                player.Yaw, player.Pitch, flags: 0, teleportId: player.TeleportId)
+        };
+
+        foreach (var frame in frames)
+            await session.SendFrameAsync(frame, ct);
+
+        Log($"Join sequence sent: sessionId={session.SessionId}, entityId={player.EntityId}");
     }
 
     private static void Log(string message)
