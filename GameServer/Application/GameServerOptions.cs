@@ -4,12 +4,14 @@ namespace GameServer.Application;
 
 public sealed record GameServerOptions(
     IPEndPoint GatewayBackendListenEndPoint,
-    bool EnableCompression = false)
+    bool EnableCompression = false,
+    string PlayerDataDirectory = "data/players")
 {
     public static GameServerOptions CreateDefault()
     {
         return new GameServerOptions(
             GatewayBackendListenEndPoint: new IPEndPoint(IPAddress.Loopback, 25566),
-            EnableCompression: false);
+            EnableCompression: false,
+            PlayerDataDirectory: "data/players");
     }
 }

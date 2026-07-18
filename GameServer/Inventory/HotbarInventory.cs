@@ -43,6 +43,43 @@ public sealed class HotbarInventory
             _slots[SelectedSlot] = null;
         return true;
     }
+
+    public ItemStackSnapshot?[] Snapshot()
+    {
+        var snapshot = new ItemStackSnapshot?[SlotCount];
+        for (var i = 0; i < SlotCount; i++)
+            snapshot[i] = _slots[i]?.ToSnapshot();
+        return snapshot;
+    }
+
+    /// <summary>Atomically replaces the hotbar when every saved slot is valid.</summary>
+    public bool TryRestore(int selectedSlot, IReadOnlyList<ItemStackSnapshot?>? slots)
+    {
+        if ((uint)selectedSlot >= SlotCount || slots == null || slots.Count != SlotCount)
+            return false;
+
+        var restored = new ItemStack?[SlotCount];
+        try
+        {
+            for (var i = 0; i < SlotCount; i++)
+            {
+                var snapshot = slots[i];
+                if (snapshot.HasValue)
+                {
+                    var value = snapshot.Value;
+                    restored[i] = new ItemStack(value.ItemId, value.BlockState, value.Count);
+                }
+            }
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return false;
+        }
+
+        Array.Copy(restored, _slots, SlotCount);
+        SelectedSlot = selectedSlot;
+        return true;
+    }
 }
 
 /// <summary>Only IDs required by the M6 starter hotbar.</summary>

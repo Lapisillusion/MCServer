@@ -8,6 +8,7 @@ using GameServer.Core.Dispatch;
 using GameServer.Core.Session;
 using GameServer.Network;
 using GameServer.Players;
+using GameServer.Persistence;
 using GameServer.Replication;
 using static GameServer.Core.Diagnostics.GameLogger;
 
@@ -20,6 +21,8 @@ public sealed class BackendGatewayServer
     private readonly SessionRegistry _sessions;
     private readonly PlayerJoinFlow _joinFlow;
     private readonly EntityTracker _entityTracker;
+    private readonly PlayerManager _playerManager;
+    private readonly IPlayerDataStore _playerDataStore;
     private readonly ConcurrentDictionary<long, Task> _sessionLoops = new();
 
     private TcpListener? _listener;
@@ -29,13 +32,17 @@ public sealed class BackendGatewayServer
         SessionRegistry sessions,
         PlayPacketDispatcher dispatcher,
         PlayerJoinFlow joinFlow,
-        EntityTracker entityTracker)
+        EntityTracker entityTracker,
+        PlayerManager playerManager,
+        IPlayerDataStore playerDataStore)
     {
         _options = options;
         _sessions = sessions;
         _dispatcher = dispatcher;
         _joinFlow = joinFlow;
         _entityTracker = entityTracker;
+        _playerManager = playerManager;
+        _playerDataStore = playerDataStore;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -157,8 +164,20 @@ public sealed class BackendGatewayServer
                 {
                     var entityId = session.Player.EntityId;
                     var playerId = session.Player.PlayerId;
+                    try
+                    {
+                        await _playerDataStore.SaveAsync(PlayerStatePersistence.Capture(session.Player), CancellationToken.None);
+                        Info("PlayerPersistence", session.SessionId, $"Saved player state for {playerId}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Error("PlayerPersistence", session.SessionId,
+                            $"Could not save player state: {ex.GetType().Name}: {ex.Message}");
+                    }
+
                     _entityTracker.RemoveEntity(entityId);
                     _entityTracker.RemoveObserver(session.SessionId);
+                    _playerManager.RemovePlayer(entityId, out _);
 
                     var destroyPkt = S2CPacketBuilders.BuildDestroyEntities(new[] { entityId });
                     var listRemove = S2CPacketBuilders.BuildPlayerListItemRemove(playerId);

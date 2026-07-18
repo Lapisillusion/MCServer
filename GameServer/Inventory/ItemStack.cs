@@ -31,4 +31,9 @@ public sealed class ItemStack
         Count--;
         return true;
     }
+
+    public ItemStackSnapshot ToSnapshot() => new(ItemId, BlockState, Count);
 }
+
+/// <summary>Serializable representation of a minimal item stack.</summary>
+public readonly record struct ItemStackSnapshot(int ItemId, int BlockState, int Count);

@@ -5,6 +5,9 @@
 # Ignore all bin and obj folders in all subdirectories
 **/bin/
 **/obj/
+**/.verification/
+**/.claude/
+**/.codegraph/
 
 ############################################
 # Visual Studio

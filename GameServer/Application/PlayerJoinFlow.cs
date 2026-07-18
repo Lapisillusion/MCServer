@@ -3,6 +3,7 @@ using GameServer.Core.Session;
 using GameServer.Dimension;
 using GameServer.Network;
 using GameServer.Players;
+using GameServer.Persistence;
 using GameServer.Replication;
 using GameServer.World;
 using static GameServer.Core.Diagnostics.GameLogger;
@@ -25,6 +26,7 @@ public sealed class PlayerJoinFlow
     private readonly GameServerOptions _options;
     private readonly SessionRegistry _sessions;
     private readonly EntityTracker _entityTracker;
+    private readonly IPlayerDataStore _playerDataStore;
 
     public PlayerJoinFlow(
         PlayerManager playerManager,
@@ -32,7 +34,8 @@ public sealed class PlayerJoinFlow
         DimensionManager dimensionManager,
         GameServerOptions options,
         SessionRegistry sessions,
-        EntityTracker entityTracker)
+        EntityTracker entityTracker,
+        IPlayerDataStore playerDataStore)
     {
         _playerManager = playerManager;
         _spawnManager = spawnManager;
@@ -40,6 +43,7 @@ public sealed class PlayerJoinFlow
         _options = options;
         _sessions = sessions;
         _entityTracker = entityTracker;
+        _playerDataStore = playerDataStore;
     }
 
     public async Task ExecuteAsync(SessionContext session, CancellationToken ct)
@@ -47,10 +51,7 @@ public sealed class PlayerJoinFlow
         // 1. Determine spawn
         var spawn = _spawnManager.GetSpawnInfo();
 
-        // 2. Validate dimension
-        var dimDef = _dimensionManager.GetDimension(spawn.Dimension);
-
-        // 3. Create player context with unique EntityId
+        // 2. Create player context with unique EntityId and apply spawn defaults.
         var player = _playerManager.CreatePlayer(session.PlayerId);
         player.PlayerName = session.PlayerName;
         player.Dimension = spawn.Dimension;
@@ -61,6 +62,26 @@ public sealed class PlayerJoinFlow
         player.Pitch = spawn.Pitch;
         player.OnGround = true; // standing on superflat grass at Y=4.0
         session.Player = player;
+
+        try
+        {
+            var saved = await _playerDataStore.LoadAsync(player.PlayerId, ct);
+            if (saved != null)
+            {
+                if (PlayerStatePersistence.TryApply(player, saved, _dimensionManager, out var restoreError))
+                    Info("PlayerPersistence", session.SessionId, $"Restored player state for {player.PlayerId}");
+                else
+                    Warn("PlayerPersistence", session.SessionId, $"Ignored invalid player state: {restoreError}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Warn("PlayerPersistence", session.SessionId,
+                $"Could not load player state; using spawn defaults: {ex.GetType().Name}");
+        }
+
+        // 3. Validate the active (restored or default) dimension before building join frames.
+        var dimDef = _dimensionManager.GetDimension(player.Dimension);
 
         Info("JoinFlow", session.SessionId,
             $"Starting join, playerId={session.PlayerId}, entityId={player.EntityId}, " +
