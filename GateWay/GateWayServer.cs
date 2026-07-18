@@ -8,7 +8,9 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
-using Common;
+using Common.MC;
+using Common.Network;
+using Common.Pooling;
 using Serilog;
 
 namespace GateWay;
@@ -412,7 +414,7 @@ public sealed class GateWayServer
                     return;
                 }
 
-                if (stateBefore == ConnState.Handshake && pid == Protocol340Ids.C2S_Handshake)
+                if (stateBefore == ConnState.Handshake && pid == Protocol340Ids.Handshake.C2S_Handshake)
                 {
                     if (!McFrameParser.TryParseHandshake(frameSpan, out var handshake))
                     {
@@ -462,7 +464,7 @@ public sealed class GateWayServer
                 }
                 else if (stateBefore == ConnState.Status)
                 {
-                    if (pid == Protocol340Ids.C2S_StatusRequest)
+                    if (pid == Protocol340Ids.Status.C2S_Request)
                     {
                         if (!McFrameParser.TryIsStatusRequest(frameSpan))
                         {
@@ -475,7 +477,7 @@ public sealed class GateWayServer
                         forwardToBackend = false;
                         SendStatusResponse(ctx);
                     }
-                    else if (pid == Protocol340Ids.C2S_StatusPing)
+                    else if (pid == Protocol340Ids.Status.C2S_Ping)
                     {
                         if (!McFrameParser.TryReadStatusPingPayload(frameSpan, out var payload))
                         {
@@ -489,7 +491,7 @@ public sealed class GateWayServer
                         SendStatusPongAndClose(ctx, payload);
                     }
                 }
-                else if (stateBefore == ConnState.Login && pid == Protocol340Ids.C2S_LoginStart)
+                else if (stateBefore == ConnState.Login && pid == Protocol340Ids.Login.C2S_LoginStart)
                 {
                     if (!_limiter.TryAcceptLogin(ctx.IpV4))
                     {
@@ -568,7 +570,7 @@ public sealed class GateWayServer
             return false;
 
         var off = 0;
-        if (!VarInt.TryRead(temp[..peek], ref off, out var payloadLen))
+        if (!VarIntCodec.TryRead(temp[..peek], ref off, out var payloadLen))
             return false;
 
         if (payloadLen < 0 || payloadLen > McFrameParser.MaxFramePayload)
@@ -643,6 +645,17 @@ public sealed class GateWayServer
         EnqueueSend(ctx, ctx.ClientSend, item, ctx.Client, ctx.ClientSendSaea, "client-send");
         ctx.State = ConnState.Play;
 
+        // Send PlayerSessionOpen handshake to GameServer so it can identify this player.
+        var handshake = BuildPlayerSessionOpenFrame(playerUuid, playerName);
+        var hsItem = new SendWorkItem
+        {
+            Segment1 = new ArraySegment<byte>(handshake, 0, handshake.Length),
+            Segment2 = default,
+            TotalLength = handshake.Length
+        };
+        EnqueueSend(ctx, ctx.BackendSend, hsItem, GetBackendSocketOrThrow(ctx),
+            GetBackendSendSaeaOrThrow(ctx), "backend-send");
+
         // Start receiving from backend now that we're in Play state.
         StartReceive(ctx.Backend!, ctx.BackendRecvSaea!);
 
@@ -669,19 +682,47 @@ public sealed class GateWayServer
         var nameBytes = Encoding.UTF8.GetBytes(playerName);
         Span<byte> varIntBuf = stackalloc byte[5];
 
-        var uuidLenVarInt = VarInt.Write(varIntBuf, uuidBytes.Length);
-        var nameLenVarInt = VarInt.Write(varIntBuf, nameBytes.Length);
+        var uuidLenVarInt = VarIntCodec.Write(varIntBuf, uuidBytes.Length);
+        var nameLenVarInt = VarIntCodec.Write(varIntBuf, nameBytes.Length);
         var payloadLen = 1 + uuidLenVarInt + uuidBytes.Length + nameLenVarInt + nameBytes.Length;
-        var frameLenVarInt = VarInt.Write(varIntBuf, payloadLen);
+        var frameLenVarInt = VarIntCodec.Write(varIntBuf, payloadLen);
 
         var frame = new byte[frameLenVarInt + payloadLen];
         var offset = 0;
-        offset += VarInt.Write(frame.AsSpan(offset), payloadLen);
-        offset += VarInt.Write(frame.AsSpan(offset), Protocol340Ids.S2C_LoginSuccess);
-        offset += VarInt.Write(frame.AsSpan(offset), uuidBytes.Length);
+        offset += VarIntCodec.Write(frame.AsSpan(offset), payloadLen);
+        offset += VarIntCodec.Write(frame.AsSpan(offset), Protocol340Ids.Login.S2C_LoginSuccess);
+        offset += VarIntCodec.Write(frame.AsSpan(offset), uuidBytes.Length);
         uuidBytes.CopyTo(frame.AsSpan(offset));
         offset += uuidBytes.Length;
-        offset += VarInt.Write(frame.AsSpan(offset), nameBytes.Length);
+        offset += VarIntCodec.Write(frame.AsSpan(offset), nameBytes.Length);
+        nameBytes.CopyTo(frame.AsSpan(offset));
+        return frame;
+    }
+
+    /// <summary>
+    /// Builds the PlayerSessionOpen handshake frame sent to GameServer.
+    /// Format: [VarInt frameLength] [u8 msgType=0x01] [string uuid] [string name]
+    /// </summary>
+    private static byte[] BuildPlayerSessionOpenFrame(string playerUuid, string playerName)
+    {
+        var uuidBytes = Encoding.UTF8.GetBytes(playerUuid.ToLowerInvariant());
+        var nameBytes = Encoding.UTF8.GetBytes(playerName);
+        Span<byte> varIntBuf = stackalloc byte[5];
+
+        // Payload: u8(1) + string(uuid) + string(name)
+        var uuidLenVarInt = VarIntCodec.Write(varIntBuf, uuidBytes.Length);
+        var nameLenVarInt = VarIntCodec.Write(varIntBuf, nameBytes.Length);
+        var payloadLen = 1 + uuidLenVarInt + uuidBytes.Length + nameLenVarInt + nameBytes.Length;
+        var frameLenVarInt = VarIntCodec.Write(varIntBuf, payloadLen);
+
+        var frame = new byte[frameLenVarInt + payloadLen];
+        var offset = 0;
+        offset += VarIntCodec.Write(frame.AsSpan(offset), payloadLen);
+        frame[offset++] = 0x01; // PlayerSessionOpen
+        offset += VarIntCodec.Write(frame.AsSpan(offset), uuidBytes.Length);
+        uuidBytes.CopyTo(frame.AsSpan(offset));
+        offset += uuidBytes.Length;
+        offset += VarIntCodec.Write(frame.AsSpan(offset), nameBytes.Length);
         nameBytes.CopyTo(frame.AsSpan(offset));
         return frame;
     }
@@ -709,15 +750,15 @@ public sealed class GateWayServer
         var reasonBytes = Encoding.UTF8.GetBytes(reasonJson);
         Span<byte> varIntBuf = stackalloc byte[5];
 
-        var reasonLenVarInt = VarInt.Write(varIntBuf, reasonBytes.Length);
+        var reasonLenVarInt = VarIntCodec.Write(varIntBuf, reasonBytes.Length);
         var payloadLen = 1 + reasonLenVarInt + reasonBytes.Length;
-        var frameLenVarInt = VarInt.Write(varIntBuf, payloadLen);
+        var frameLenVarInt = VarIntCodec.Write(varIntBuf, payloadLen);
 
         var frame = new byte[frameLenVarInt + payloadLen];
         var offset = 0;
-        offset += VarInt.Write(frame.AsSpan(offset), payloadLen);
-        offset += VarInt.Write(frame.AsSpan(offset), Protocol340Ids.S2C_LoginDisconnect);
-        offset += VarInt.Write(frame.AsSpan(offset), reasonBytes.Length);
+        offset += VarIntCodec.Write(frame.AsSpan(offset), payloadLen);
+        offset += VarIntCodec.Write(frame.AsSpan(offset), Protocol340Ids.Login.S2C_Disconnect);
+        offset += VarIntCodec.Write(frame.AsSpan(offset), reasonBytes.Length);
         reasonBytes.CopyTo(frame.AsSpan(offset));
         return frame;
     }
@@ -732,19 +773,21 @@ public sealed class GateWayServer
     private void LogParsedClientPacket(ConnectionContext ctx, ConnState stateBefore, int packetId, int frameLen, int payloadLen,
         object? parsed, bool forwardToBackend)
     {
+        var packetName = PacketNameResolver.GetNameOrDefault(packetId);
         var result = new
         {
-            Direction = "client->gateway",
+            Direction = "C2S",
             ContextId = ctx.Id,
             State = stateBefore.ToString(),
             PacketId = $"0x{packetId:X2}",
+            PacketName = packetName,
             FrameLength = frameLen,
             PayloadLength = payloadLen,
             ForwardToBackend = forwardToBackend,
             Parsed = parsed
         };
 
-        Logger.Information("Parsed packet {@Packet}", result);
+        Logger.Information("Parsed packet {PacketName} {@Packet}", packetName, result);
     }
 
     private void EnqueueBackendZeroCopy(ConnectionContext ctx, ArraySegment<byte> seg1, ArraySegment<byte> seg2, int totalLen)
@@ -1170,16 +1213,16 @@ public sealed class GateWayServer
         var jsonBytes = Encoding.UTF8.GetBytes(json);
         Span<byte> varIntBuf = stackalloc byte[5];
 
-        var jsonLenVarInt = VarInt.Write(varIntBuf, jsonBytes.Length);
+        var jsonLenVarInt = VarIntCodec.Write(varIntBuf, jsonBytes.Length);
         var payloadLen = 1 + jsonLenVarInt + jsonBytes.Length; // packetId + string len + string bytes
-        var frameLenVarInt = VarInt.Write(varIntBuf, payloadLen);
+        var frameLenVarInt = VarIntCodec.Write(varIntBuf, payloadLen);
 
         var frame = new byte[frameLenVarInt + payloadLen];
         var offset = 0;
 
-        offset += VarInt.Write(frame.AsSpan(offset), payloadLen);
-        frame[offset++] = (byte)Protocol340Ids.S2C_StatusResponse;
-        offset += VarInt.Write(frame.AsSpan(offset), jsonBytes.Length);
+        offset += VarIntCodec.Write(frame.AsSpan(offset), payloadLen);
+        frame[offset++] = (byte)Protocol340Ids.Status.S2C_Response;
+        offset += VarIntCodec.Write(frame.AsSpan(offset), jsonBytes.Length);
         jsonBytes.CopyTo(frame.AsSpan(offset));
 
         return frame;
@@ -1216,12 +1259,12 @@ public sealed class GateWayServer
     {
         const int pongPayloadLen = 1 + 8; // packetId + long
         Span<byte> varIntBuf = stackalloc byte[5];
-        var frameLenVarInt = VarInt.Write(varIntBuf, pongPayloadLen);
+        var frameLenVarInt = VarIntCodec.Write(varIntBuf, pongPayloadLen);
         var frame = ArrayPool<byte>.Shared.Rent(frameLenVarInt + pongPayloadLen);
 
         var offset = 0;
-        offset += VarInt.Write(frame.AsSpan(offset), pongPayloadLen);
-        frame[offset++] = (byte)Protocol340Ids.S2C_StatusPong;
+        offset += VarIntCodec.Write(frame.AsSpan(offset), pongPayloadLen);
+        frame[offset++] = (byte)Protocol340Ids.Status.S2C_Pong;
 
         var value = unchecked((ulong)payload);
         for (var i = 7; i >= 0; i--)

@@ -13,12 +13,14 @@ public class GateWayStarter
             .MinimumLevel.Debug()
             .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
             .Enrich.FromLogContext()
+            .Enrich.WithProperty("Service", "GateWay")
             .WriteTo.Console()
             .WriteTo.File(
                 path: "logs/gateway-.log",
                 rollingInterval: RollingInterval.Day,
                 retainedFileCountLimit: 14,
                 shared: true)
+            .WriteTo.Seq("http://localhost:5341")
             .CreateLogger();
 
         try

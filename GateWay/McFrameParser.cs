@@ -1,5 +1,6 @@
 using System.Text;
-using Common;
+using Common.Buffers;
+using Common.MC;
 
 namespace GateWay;
 
@@ -21,7 +22,7 @@ public static class McFrameParser
             return false;
 
         var off = 0;
-        if (!VarInt.TryRead(temp[..peek], ref off, out var payloadLen))
+        if (!VarIntCodec.TryRead(temp[..peek], ref off, out var payloadLen))
             return false;
 
         if (payloadLen < 0 || payloadLen > MaxFramePayload)
@@ -38,7 +39,7 @@ public static class McFrameParser
     public static bool TryGetPacketId(ReadOnlySpan<byte> frameSpan, out int packetId, out int payloadOffset)
     {
         var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out _))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out _))
         {
             packetId = 0;
             payloadOffset = 0;
@@ -46,7 +47,7 @@ public static class McFrameParser
         }
 
         payloadOffset = off;
-        if (!VarInt.TryRead(frameSpan, ref off, out packetId))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out packetId))
         {
             packetId = 0;
             payloadOffset = 0;
@@ -73,7 +74,7 @@ public static class McFrameParser
         handshake = default;
 
         var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var payloadLen))
             return false;
         if (payloadLen < 0 || payloadLen > MaxFramePayload)
             return false;
@@ -81,12 +82,12 @@ public static class McFrameParser
         if (payloadEnd != frameSpan.Length)
             return false;
 
-        if (!VarInt.TryRead(frameSpan, ref off, out var pid))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var pid))
             return false;
-        if (pid != Protocol340Ids.C2S_Handshake)
+        if (pid != Protocol340Ids.Handshake.C2S_Handshake)
             return false;
 
-        if (!VarInt.TryRead(frameSpan, ref off, out var protocolVersion))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var protocolVersion))
             return false;
         if (!TryReadString(frameSpan, ref off, MaxStringLen, out var serverAddress))
             return false;
@@ -96,7 +97,7 @@ public static class McFrameParser
         var serverPort = (ushort)((frameSpan[off] << 8) | frameSpan[off + 1]);
         off += 2;
 
-        if (!VarInt.TryRead(frameSpan, ref off, out var nextState))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var nextState))
             return false;
         if (nextState is not (1 or 2))
             return false;
@@ -117,7 +118,7 @@ public static class McFrameParser
         loginStart = default;
 
         var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var payloadLen))
             return false;
         if (payloadLen < 0 || payloadLen > MaxFramePayload)
             return false;
@@ -125,9 +126,9 @@ public static class McFrameParser
         if (payloadEnd != frameSpan.Length)
             return false;
 
-        if (!VarInt.TryRead(frameSpan, ref off, out var pid))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var pid))
             return false;
-        if (pid != Protocol340Ids.C2S_LoginStart)
+        if (pid != Protocol340Ids.Login.C2S_LoginStart)
             return false;
 
         if (!TryReadString(frameSpan, ref off, MaxNameLen, out var userName))
@@ -146,13 +147,13 @@ public static class McFrameParser
     public static bool TryIsStatusRequest(ReadOnlySpan<byte> frameSpan)
     {
         var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var payloadLen))
             return false;
         if (payloadLen != 1)
             return false;
-        if (!VarInt.TryRead(frameSpan, ref off, out var pid))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var pid))
             return false;
-        return pid == Protocol340Ids.C2S_StatusRequest && off == frameSpan.Length;
+        return pid == Protocol340Ids.Status.C2S_Request && off == frameSpan.Length;
     }
 
     public static bool TryReadStatusPingPayload(ReadOnlySpan<byte> frameSpan, out long payload)
@@ -160,11 +161,11 @@ public static class McFrameParser
         payload = 0;
 
         var off = 0;
-        if (!VarInt.TryRead(frameSpan, ref off, out var payloadLen))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var payloadLen))
             return false;
-        if (!VarInt.TryRead(frameSpan, ref off, out var pid))
+        if (!VarIntCodec.TryRead(frameSpan, ref off, out var pid))
             return false;
-        if (pid != Protocol340Ids.C2S_StatusPing)
+        if (pid != Protocol340Ids.Status.C2S_Ping)
             return false;
         if (payloadLen != 9)
             return false;
@@ -182,7 +183,7 @@ public static class McFrameParser
     private static bool TryReadString(ReadOnlySpan<byte> src, ref int off, int maxLen, out string value)
     {
         value = string.Empty;
-        if (!VarInt.TryRead(src, ref off, out var strLen))
+        if (!VarIntCodec.TryRead(src, ref off, out var strLen))
             return false;
         if (strLen < 0 || strLen > maxLen)
             return false;

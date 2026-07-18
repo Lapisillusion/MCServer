@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using Common.MC;
 
 namespace GameServer.Network.Backend;
 
@@ -6,34 +7,9 @@ public static class McPlayFrameCodec
 {
     public const int MaxFramePayload = 2 * 1024 * 1024;
 
+    /// <summary>Read a VarInt from the span. Delegates to Common VarIntCodec.</summary>
     public static bool TryReadVarInt(ReadOnlySpan<byte> source, ref int offset, out int value)
-    {
-        value = 0;
-        var numRead = 0;
-
-        while (true)
-        {
-            if (offset >= source.Length)
-            {
-                value = 0;
-                return false;
-            }
-
-            var current = source[offset++];
-            var payload = current & 0b0111_1111;
-            value |= payload << (7 * numRead);
-
-            numRead++;
-            if (numRead > 5)
-            {
-                value = 0;
-                return false;
-            }
-
-            if ((current & 0b1000_0000) == 0)
-                return true;
-        }
-    }
+        => VarIntCodec.TryRead(source, ref offset, out value);
 
     public static async ValueTask<byte[]?> ReadFrameAsync(NetworkStream stream, CancellationToken cancellationToken)
     {

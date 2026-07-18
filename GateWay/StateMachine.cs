@@ -1,4 +1,4 @@
-﻿// StateMachine.cs
+﻿using Common.MC;
 
 namespace GateWay;
 
@@ -17,10 +17,10 @@ public static class StateMachine
     {
         return state switch
         {
-            ConnState.Handshake => packetId == Protocol340Ids.C2S_Handshake,
-            ConnState.Status => packetId == Protocol340Ids.C2S_StatusRequest
-                                || packetId == Protocol340Ids.C2S_StatusPing,
-            ConnState.Login => packetId == Protocol340Ids.C2S_LoginStart,
+            ConnState.Handshake => packetId == Protocol340Ids.Handshake.C2S_Handshake,
+            ConnState.Status => packetId == Protocol340Ids.Status.C2S_Request
+                                || packetId == Protocol340Ids.Status.C2S_Ping,
+            ConnState.Login => packetId == Protocol340Ids.Login.C2S_LoginStart,
             ConnState.Play => true, // MVP: 不拦 Play
             _ => false
         };

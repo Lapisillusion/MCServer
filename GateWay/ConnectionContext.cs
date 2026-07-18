@@ -3,7 +3,7 @@
 using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Threading;
-using Common;
+using Common.Buffers;
 
 namespace GateWay;
 

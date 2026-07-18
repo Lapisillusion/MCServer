@@ -1,12 +1,14 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using GameServer.Application;
 using GameServer.Core.Diagnostics;
 using GameServer.Core.Dispatch;
 using GameServer.Core.Session;
 using GameServer.Network;
 using GameServer.Players;
+using static GameServer.Core.Diagnostics.GameLogger;
 
 namespace GameServer.Network.Backend;
 
@@ -15,6 +17,7 @@ public sealed class BackendGatewayServer
     private readonly PlayPacketDispatcher _dispatcher;
     private readonly GameServerOptions _options;
     private readonly SessionRegistry _sessions;
+    private readonly PlayerJoinFlow _joinFlow;
     private readonly ConcurrentDictionary<long, Task> _sessionLoops = new();
 
     private TcpListener? _listener;
@@ -22,18 +25,20 @@ public sealed class BackendGatewayServer
     public BackendGatewayServer(
         GameServerOptions options,
         SessionRegistry sessions,
-        PlayPacketDispatcher dispatcher)
+        PlayPacketDispatcher dispatcher,
+        PlayerJoinFlow joinFlow)
     {
         _options = options;
         _sessions = sessions;
         _dispatcher = dispatcher;
+        _joinFlow = joinFlow;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         _listener = new TcpListener(_options.GatewayBackendListenEndPoint);
         _listener.Start();
-        Log($"Listening Gateway backend on {_options.GatewayBackendListenEndPoint}");
+        Info("BackendGateway", $"Listening on {_options.GatewayBackendListenEndPoint}");
 
         try
         {
@@ -51,7 +56,7 @@ public sealed class BackendGatewayServer
 
                 if (!IsLoopback(socket))
                 {
-                    Log($"Rejected non-loopback backend connection: {socket.RemoteEndPoint}");
+                    Warn("BackendGateway", $"Rejected non-loopback connection: {socket.RemoteEndPoint}");
                     SafeClose(socket);
                     continue;
                 }
@@ -59,7 +64,6 @@ public sealed class BackendGatewayServer
                 socket.NoDelay = true;
 
                 var session = _sessions.Create(socket);
-                session.State = GameSessionState.Play;
                 var loopTask = RunSessionLoopAsync(session, cancellationToken);
                 _sessionLoops.TryAdd(session.SessionId, loopTask);
                 _ = loopTask.ContinueWith(
@@ -82,35 +86,52 @@ public sealed class BackendGatewayServer
 
     private async Task RunSessionLoopAsync(SessionContext session, CancellationToken cancellationToken)
     {
-        Log($"Session opened: sessionId={session.SessionId}, remote={session.Socket.RemoteEndPoint}");
+        Info("Session", session.SessionId, $"Session opened, remote={session.Socket.RemoteEndPoint}");
 
         try
         {
             using var stream = new NetworkStream(session.Socket, ownsSocket: false);
             session.Stream = stream;
 
-            await SendJoinSequenceAsync(session, cancellationToken);
+            // Read Gateway handshake to identify the player before join sequence.
+            await ReadGatewayHandshakeAsync(stream, session, cancellationToken);
 
-            while (!cancellationToken.IsCancellationRequested && !session.Closed)
+            session.State = GameSessionState.Joining;
+
+            await _joinFlow.ExecuteAsync(session, cancellationToken);
+
+            Info("Session", session.SessionId, "Entering read loop, enqueuing to tick pipeline");
+
+            // Start periodic KeepAlive sender — client disconnects after ~30s without one.
+            // In v0.3.2, KeepAlive frames are enqueued to the tick pipeline's output queue,
+            // flushed by NetworkFlushStage (single writer, no concurrency risk).
+            var keepAliveCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var keepAliveTask = RunKeepAliveLoopAsync(session, keepAliveCts.Token);
+
+            try
             {
-                var frame = await McPlayFrameCodec.ReadFrameAsync(stream, cancellationToken);
-                if (frame == null)
-                    break;
-
-                session.Touch();
-                if (!McPlayFrameCodec.TryGetPacketId(frame, out var packetId))
+                while (!cancellationToken.IsCancellationRequested && !session.Closed)
                 {
-                    Log($"Invalid frame from session={session.SessionId}, disconnect.");
-                    break;
+                    var frame = await McPlayFrameCodec.ReadFrameAsync(stream, cancellationToken);
+                    if (frame == null)
+                        break;
+
+                    session.Touch();
+                    if (!McPlayFrameCodec.TryGetPacketId(frame, out var packetId))
+                    {
+                        Warn("Session", session.SessionId, $"Invalid frame, disconnecting");
+                        break;
+                    }
+
+                    // Fast path: only deserialize and enqueue. All game logic runs in the tick loop.
+                    session.EnqueueInput(packetId, frame);
                 }
-
-                var context = RuntimeLogContext.Empty
-                    .WithSessionId(session.SessionId.ToString())
-                    .WithPlayerId(session.PlayerId)
-                    .WithPacketId($"0x{packetId:X2}")
-                    .WithTickId(-1);
-
-                await _dispatcher.DispatchOrIgnoreAsync(session, packetId, context, frame, cancellationToken);
+            }
+            finally
+            {
+                keepAliveCts.Cancel();
+                await keepAliveTask;
+                keepAliveCts.Dispose();
             }
         }
         catch (OperationCanceledException)
@@ -118,7 +139,7 @@ public sealed class BackendGatewayServer
         }
         catch (Exception ex)
         {
-            Log($"Session loop error: sessionId={session.SessionId}, ex={ex.GetType().Name}, msg={ex.Message}");
+            Error("Session", session.SessionId, $"Session loop error: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
@@ -126,8 +147,36 @@ public sealed class BackendGatewayServer
             {
                 _sessions.Remove(session.SessionId, out _);
                 SafeClose(session.Socket);
-                Log($"Session closed: sessionId={session.SessionId}");
+                Info("Session", session.SessionId, $"Session closed");
             }
+        }
+    }
+
+    private static async Task RunKeepAliveLoopAsync(SessionContext session, CancellationToken ct)
+    {
+        var keepAliveId = (long)(DateTime.UtcNow.Ticks & 0x7FFFFFFFFFFFFFFF);
+        // Send first KeepAlive after 2s, then every 5s.
+        // Vanilla client times out after ~30s of no KeepAlive.
+        const int firstDelayMs = 2000;
+        const int intervalMs = 5000;
+
+        try
+        {
+            await Task.Delay(firstDelayMs, ct);
+
+            while (!ct.IsCancellationRequested && !session.Closed)
+            {
+                var frame = S2CPacketBuilders.BuildKeepAlive(keepAliveId);
+                // Enqueue via tick pipeline — flushed by NetworkFlushStage (single writer, no concurrency risk)
+                session.EnqueueOutput(frame);
+                Info("KeepAlive", session.SessionId, $"S2C KeepAlive enqueued, id={keepAliveId}");
+                keepAliveId++;
+
+                await Task.Delay(intervalMs, ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
         }
     }
 
@@ -173,42 +222,70 @@ public sealed class BackendGatewayServer
         }
     }
 
-    private static async Task SendJoinSequenceAsync(SessionContext session, CancellationToken ct)
+    /// <summary>
+    /// Reads the PlayerSessionOpen handshake frame from Gateway.
+    /// Format: [VarInt frameLength] [u8 msgType=0x01] [string playerUuid] [string playerName]
+    /// Sets session.PlayerId so the join flow can identify the player.
+    /// </summary>
+    private static async Task ReadGatewayHandshakeAsync(
+        NetworkStream stream, SessionContext session, CancellationToken ct)
     {
-        var player = new PlayerContext
+        // Read VarInt frame length byte-by-byte
+        var lenBuf = new byte[5];
+        var lenRead = 0;
+        var singleByte = new byte[1];
+        for (var i = 0; i < 5; i++)
         {
-            EntityId = 0,
-            Gamemode = 0, // Survival
-            Dimension = 0, // Overworld
-            X = 0.5,
-            Y = 4.0,
-            Z = 0.5,
-            Yaw = 0f,
-            Pitch = 0f,
-            TeleportId = 1
-        };
-        session.Player = player;
+            var n = await stream.ReadAsync(singleByte.AsMemory(), ct);
+            if (n == 0) throw new EndOfStreamException("Connection closed before handshake");
+            lenBuf[i] = singleByte[0];
+            lenRead++;
+            if ((singleByte[0] & 0x80) == 0) break;
+        }
 
-        var frames = new[]
+        var lenOff = 0;
+        if (!McPlayFrameCodec.TryReadVarInt(lenBuf.AsSpan(0, lenRead), ref lenOff, out var frameLen)
+            || frameLen < 1 || frameLen > 1024)
+            throw new InvalidOperationException($"Invalid handshake frame length: {frameLen}");
+
+        // Read frame body
+        var body = new byte[frameLen];
+        var totalRead = 0;
+        while (totalRead < frameLen)
         {
-            S2CPacketBuilders.BuildJoinGame(player.EntityId, player.Gamemode, player.Dimension,
-                difficulty: 2, maxPlayers: 0, levelType: "flat", reducedDebugInfo: false),
-            S2CPacketBuilders.BuildPluginMessage("MC|Brand", "vanilla"),
-            S2CPacketBuilders.BuildServerDifficulty(difficulty: 2),
-            S2CPacketBuilders.BuildPlayerAbilities(flags: 0, flyingSpeed: 0.05f, walkingSpeed: 0.1f),
-            S2CPacketBuilders.BuildSpawnPosition(0, 4, 0),
-            S2CPacketBuilders.BuildPlayerPositionAndLook(player.X, player.Y, player.Z,
-                player.Yaw, player.Pitch, flags: 0, teleportId: player.TeleportId)
-        };
+            var n = await stream.ReadAsync(body.AsMemory(totalRead), ct);
+            if (n == 0) throw new EndOfStreamException("Connection closed during handshake body");
+            totalRead += n;
+        }
 
-        foreach (var frame in frames)
-            await session.SendFrameAsync(frame, ct);
+        var off = 0;
+        var span = body.AsSpan();
 
-        Log($"Join sequence sent: sessionId={session.SessionId}, entityId={player.EntityId}");
+        // msgType (u8)
+        if (off >= span.Length) throw new InvalidOperationException("Handshake too short for msgType");
+        var msgType = span[off++];
+        if (msgType != 0x01)
+            throw new InvalidOperationException($"Expected PlayerSessionOpen (0x01), got 0x{msgType:X2}");
+
+        // playerUuid (string)
+        if (!McPlayFrameCodec.TryReadVarInt(span, ref off, out var uuidLen)
+            || uuidLen < 0 || uuidLen > 64 || off + uuidLen > span.Length)
+            throw new InvalidOperationException("Invalid handshake uuid");
+
+        var playerUuid = Encoding.UTF8.GetString(span.Slice(off, uuidLen));
+        off += uuidLen;
+
+        // playerName (string)
+        if (!McPlayFrameCodec.TryReadVarInt(span, ref off, out var nameLen)
+            || nameLen < 0 || nameLen > 32 || off + nameLen > span.Length)
+            throw new InvalidOperationException("Invalid handshake playerName");
+
+        var playerName = Encoding.UTF8.GetString(span.Slice(off, nameLen));
+
+        session.PlayerId = playerUuid;
+
+        Info("BackendGateway", session.SessionId,
+            $"Gateway handshake complete, playerId={playerUuid}, playerName={playerName}");
     }
 
-    private static void Log(string message)
-    {
-        Console.WriteLine($"[{DateTime.UtcNow:O}] [BackendGateway] {message}");
-    }
 }

@@ -1,45 +1,24 @@
 using System.Buffers.Binary;
+using System.IO.Compression;
 using System.Text;
+using Common.MC;
 
 namespace GameServer.Network;
 
 /// <summary>
 /// Minecraft protocol encoding utilities (protocol 340 / 1.12.2).
 /// All multi-byte integers are big-endian. Strings are VarInt-length-prefixed UTF-8.
+/// VarInt encoding delegates to Common.MC.VarIntCodec.
 /// </summary>
 public static class McProtocolWriter
 {
     /// <summary>Write a VarInt to the span. Returns the number of bytes written.</summary>
     public static int WriteVarInt(Span<byte> dst, int value)
-    {
-        var v = (uint)value;
-        var i = 0;
-        while (true)
-        {
-            if ((v & ~0x7Fu) == 0)
-            {
-                dst[i++] = (byte)v;
-                return i;
-            }
-
-            dst[i++] = (byte)((v & 0x7F) | 0x80);
-            v >>= 7;
-        }
-    }
+        => VarIntCodec.Write(dst, value);
 
     /// <summary>Returns the number of bytes needed to encode a VarInt value.</summary>
     public static int GetVarIntLength(int value)
-    {
-        var v = (uint)value;
-        var len = 0;
-        while (true)
-        {
-            len++;
-            if ((v & ~0x7Fu) == 0)
-                return len;
-            v >>= 7;
-        }
-    }
+        => VarIntCodec.GetLength(value);
 
     public static int WriteString(Span<byte> dst, string value)
     {
@@ -131,5 +110,41 @@ public static class McProtocolWriter
         offset += WriteVarInt(frame.AsSpan(offset), packetId);
         writePayload(frame.AsSpan(offset, payloadLength));
         return frame;
+    }
+
+    // ── Compression (Set Compression, Login S2C 0x03) ────
+
+    /// <summary>
+    /// Wraps a raw MC frame with the Set Compression frame format.
+    /// - If rawFrame.Length &lt; threshold: [VarInt(0)] + rawFrame
+    /// - Otherwise: [VarInt(rawFrame.Length)] + zlib(rawFrame)
+    /// </summary>
+    public static byte[] WrapCompressed(byte[] rawFrame, int threshold)
+    {
+        if (rawFrame.Length < threshold)
+        {
+            var prefixLen = GetVarIntLength(0);
+            var result = new byte[prefixLen + rawFrame.Length];
+            var off = 0;
+            off += WriteVarInt(result.AsSpan(off), 0);
+            System.Buffer.BlockCopy(rawFrame, 0, result, off, rawFrame.Length);
+            return result;
+        }
+
+        using var output = new MemoryStream(rawFrame.Length);
+        output.WriteByte(0x78);
+        output.WriteByte(0x9C);
+        using (var deflate = new DeflateStream(output, CompressionLevel.Optimal, leaveOpen: true))
+        {
+            deflate.Write(rawFrame.AsSpan());
+        }
+
+        var compressed = output.ToArray();
+        var dataLenLen = GetVarIntLength(rawFrame.Length);
+        var result2 = new byte[dataLenLen + compressed.Length];
+        var off2 = 0;
+        off2 += WriteVarInt(result2.AsSpan(off2), rawFrame.Length);
+        System.Buffer.BlockCopy(compressed, 0, result2, off2, compressed.Length);
+        return result2;
     }
 }

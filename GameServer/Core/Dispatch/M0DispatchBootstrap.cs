@@ -1,5 +1,5 @@
 using GameServer.Core.Diagnostics;
-using GameServer.Network.Internal;
+using Common.Internal;
 
 namespace GameServer.Core.Dispatch;
 

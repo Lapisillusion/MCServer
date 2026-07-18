@@ -6,10 +6,4 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
-  <ItemGroup>
-    <Folder Include="Core\" />
-    <Folder Include="Game\Protocol\" />
-    <Folder Include="Protocol\" />
-  </ItemGroup>
-
 </Project>

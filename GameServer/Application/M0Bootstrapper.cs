@@ -1,6 +1,6 @@
 using GameServer.Core.Diagnostics;
 using GameServer.Core.Dispatch;
-using GameServer.Network.Internal;
+using Common.Internal;
 using GameServer.Tick;
 
 namespace GameServer.Application;

@@ -1,22 +1,25 @@
 using System.Text;
+using Common.MC;
 
 namespace GameServer.Network;
 
 /// <summary>
 /// Minecraft 1.12.2 (protocol 340) S2C Play packet constructors.
 /// Each method returns a complete MC frame ready to write to the stream.
+/// Packet IDs from Common.MC.Protocol340Ids.
 /// </summary>
 public static class S2CPacketBuilders
 {
-    // S2C Play packet IDs (protocol 340)
-    private const int S2C_JoinGame = 0x23;
-    private const int S2C_PluginMessage = 0x18;
-    private const int S2C_ServerDifficulty = 0x0D;
-    private const int S2C_PlayerAbilities = 0x2C;
-    private const int S2C_SpawnPosition = 0x46;
-    private const int S2C_PlayerPositionAndLook = 0x2F;
-    private const int S2C_KeepAlive = 0x1F;
-    private const int S2C_ChunkData = 0x20;
+    // S2C Play packet IDs (protocol 340) — aliased for brevity
+    private const int S2C_JoinGame = Protocol340Ids.PlayS2C.JoinGame;
+    private const int S2C_PluginMessage = Protocol340Ids.PlayS2C.PluginMessage;
+    private const int S2C_ServerDifficulty = Protocol340Ids.PlayS2C.ServerDifficulty;
+    private const int S2C_PlayerAbilities = Protocol340Ids.PlayS2C.PlayerAbilities;
+    private const int S2C_SpawnPosition = Protocol340Ids.PlayS2C.SpawnPosition;
+    private const int S2C_PlayerPositionAndLook = Protocol340Ids.PlayS2C.PlayerPositionAndLook;
+    private const int S2C_KeepAlive = Protocol340Ids.PlayS2C.KeepAlive;
+    private const int S2C_ChunkData = Protocol340Ids.PlayS2C.ChunkData;
+    private const int S2C_SetCompression = Protocol340Ids.Login.S2C_SetCompression;
 
     /// <summary>Send a complete MC frame to the stream.</summary>
     public static async Task SendPacketAsync(Stream stream, byte[] frame, CancellationToken ct = default)
@@ -129,12 +132,12 @@ public static class S2CPacketBuilders
     }
 
     public static byte[] BuildChunkData(int chunkX, int chunkZ, bool groundUp,
-        int primaryBitMask, byte[] compressedData)
+        int primaryBitMask, byte[] rawChunkData)
     {
         var bitMaskLen = McProtocolWriter.GetVarIntLength(primaryBitMask);
-        var dataLen = McProtocolWriter.GetVarIntLength(compressedData.Length);
+        var dataLen = McProtocolWriter.GetVarIntLength(rawChunkData.Length);
         var blockEntitiesLen = 1; // VarInt(0) = no block entities
-        var payloadLen = 4 + 4 + 1 + bitMaskLen + dataLen + compressedData.Length + blockEntitiesLen;
+        var payloadLen = 4 + 4 + 1 + bitMaskLen + dataLen + rawChunkData.Length + blockEntitiesLen;
         return McProtocolWriter.BuildMcFrame(S2C_ChunkData, dst =>
         {
             var off = 0;
@@ -142,10 +145,87 @@ public static class S2CPacketBuilders
             off += McProtocolWriter.WriteInt32(dst[off..], chunkZ);
             off += McProtocolWriter.WriteBool(dst[off..], groundUp);
             off += McProtocolWriter.WriteVarInt(dst[off..], primaryBitMask);
-            off += McProtocolWriter.WriteVarInt(dst[off..], compressedData.Length);
-            compressedData.CopyTo(dst[off..]);
-            off += compressedData.Length;
+            off += McProtocolWriter.WriteVarInt(dst[off..], rawChunkData.Length);
+            rawChunkData.CopyTo(dst[off..]);
+            off += rawChunkData.Length;
             McProtocolWriter.WriteVarInt(dst[off..], 0); // block entities count = 0
+        }, payloadLen);
+    }
+
+    // ── v0.3.0 Block Interaction ─────────────────────────
+
+    /// <summary>S2C Block Change (0x0B). Encoded position + VarInt blockState.</summary>
+    public static byte[] BuildBlockChange(int x, int y, int z, int blockState)
+    {
+        var encoded = McProtocolWriter.EncodePosition(x, y, z);
+        var stateLen = McProtocolWriter.GetVarIntLength(blockState);
+        var payloadLen = 8 + stateLen;
+        return McProtocolWriter.BuildMcFrame(Protocol340Ids.PlayS2C.BlockChange, dst =>
+        {
+            var off = 0;
+            off += McProtocolWriter.WriteInt64(dst[off..], encoded);
+            McProtocolWriter.WriteVarInt(dst[off..], blockState);
+        }, payloadLen);
+    }
+
+    /// <summary>
+    /// S2C Animation (0x06). Animation types: 0=swing main arm, 1=damage,
+    /// 2=leave bed, 3=swing offhand, 4=critical effect, 5=magic critical.
+    /// </summary>
+    public static byte[] BuildAnimation(int entityId, byte animationType)
+    {
+        var eidLen = McProtocolWriter.GetVarIntLength(entityId);
+        var payloadLen = eidLen + 1;
+        return McProtocolWriter.BuildMcFrame(Protocol340Ids.PlayS2C.Animation, dst =>
+        {
+            var off = 0;
+            off += McProtocolWriter.WriteVarInt(dst[off..], entityId);
+            McProtocolWriter.WriteByte(dst[off..], animationType);
+        }, payloadLen);
+    }
+
+    // ── v0.3.1 Movement Validation ────────────────────────
+
+    /// <summary>S2C Entity Teleport (0x4C). Force-syncs player position.</summary>
+    public static byte[] BuildEntityTeleport(int entityId, double x, double y, double z,
+        float yaw, float pitch, bool onGround)
+    {
+        var eidLen = McProtocolWriter.GetVarIntLength(entityId);
+        var payloadLen = eidLen + 8 + 8 + 8 + 1 + 1 + 1;
+        return McProtocolWriter.BuildMcFrame(Protocol340Ids.PlayS2C.EntityTeleport, dst =>
+        {
+            var off = 0;
+            off += McProtocolWriter.WriteVarInt(dst[off..], entityId);
+            off += McProtocolWriter.WriteDouble(dst[off..], x);
+            off += McProtocolWriter.WriteDouble(dst[off..], y);
+            off += McProtocolWriter.WriteDouble(dst[off..], z);
+            off += McProtocolWriter.WriteByte(dst[off..], AngleToByte(yaw));
+            off += McProtocolWriter.WriteByte(dst[off..], AngleToByte(pitch));
+            McProtocolWriter.WriteBool(dst[off..], onGround);
+        }, payloadLen);
+    }
+
+    /// <summary>Convert float angle to protocol byte (wrapped 0-360 → 0-255).</summary>
+    private static byte AngleToByte(float angle)
+    {
+        var wrapped = angle % 360f;
+        if (wrapped < 0) wrapped += 360f;
+        return (byte)(wrapped * 256f / 360f);
+    }
+
+    // ── Set Compression (Login S2C 0x03) ────────────────
+
+    /// <summary>
+    /// S2C Set Compression (0x03). Enables packet-level zlib compression.
+    /// Sent during login, before Join Game. Packets >= threshold are compressed.
+    /// </summary>
+    public static byte[] BuildSetCompression(int threshold)
+    {
+        var threshLen = McProtocolWriter.GetVarIntLength(threshold);
+        var payloadLen = threshLen;
+        return McProtocolWriter.BuildMcFrame(S2C_SetCompression, dst =>
+        {
+            McProtocolWriter.WriteVarInt(dst, threshold);
         }, payloadLen);
     }
 }

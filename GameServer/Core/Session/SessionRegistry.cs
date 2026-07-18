@@ -10,6 +10,9 @@ public sealed class SessionRegistry
 
     public int Count => _sessions.Count;
 
+    /// <summary>All sessions for iteration. Enumeration is snapshot-safe on ConcurrentDictionary.</summary>
+    public ICollection<KeyValuePair<long, SessionContext>> All => _sessions;
+
     public SessionContext Create(Socket socket)
     {
         var sessionId = Interlocked.Increment(ref _nextSessionId);
