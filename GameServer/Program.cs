@@ -4,6 +4,7 @@ using GameServer.Core.Session;
 using GameServer.Dimension;
 using GameServer.Network.Backend;
 using GameServer.Players;
+using GameServer.Replication;
 using GameServer.Tick;
 using GameServer.Tick.Stages;
 using GameServer.World;
@@ -45,18 +46,21 @@ public static class Program
             dimensionManager.RegisterDefaults();
             var spawnManager = new SpawnManager();
             var playerManager = new PlayerManager();
-            var joinFlow = new PlayerJoinFlow(playerManager, spawnManager, dimensionManager, options);
+
+            // v0.3.0 — Entity tracking for multiplayer visibility
+            var entityTracker = new EntityTracker();
+            var joinFlow = new PlayerJoinFlow(playerManager, spawnManager, dimensionManager, options, sessions, entityTracker);
 
             // v0.2.1 — Chunk Provider (shared storage for generated chunks)
             var chunkProvider = new ChunkProvider();
 
             var playDispatcher = M1PlayDispatchBootstrap.Build(chunkProvider, sessions);
-            var server = new BackendGatewayServer(options, sessions, playDispatcher, joinFlow);
+            var server = new BackendGatewayServer(options, sessions, playDispatcher, joinFlow, entityTracker);
 
             // v0.3.2 — Tick Pipeline stages (InputCollect → Simulate → Replication → NetworkFlush)
             var inputCollect = new InputCollectStage(sessions, playDispatcher);
             var simulate = new SimulateStage();
-            var replication = new ReplicationStage();
+            var replication = new ReplicationStage(sessions, entityTracker);
             var networkFlush = new NetworkFlushStage(sessions, options);
 
             var tickScheduler = new TickScheduler(new ITickStage[]

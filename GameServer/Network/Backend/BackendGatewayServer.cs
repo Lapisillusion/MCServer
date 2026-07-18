@@ -8,6 +8,7 @@ using GameServer.Core.Dispatch;
 using GameServer.Core.Session;
 using GameServer.Network;
 using GameServer.Players;
+using GameServer.Replication;
 using static GameServer.Core.Diagnostics.GameLogger;
 
 namespace GameServer.Network.Backend;
@@ -18,6 +19,7 @@ public sealed class BackendGatewayServer
     private readonly GameServerOptions _options;
     private readonly SessionRegistry _sessions;
     private readonly PlayerJoinFlow _joinFlow;
+    private readonly EntityTracker _entityTracker;
     private readonly ConcurrentDictionary<long, Task> _sessionLoops = new();
 
     private TcpListener? _listener;
@@ -26,12 +28,14 @@ public sealed class BackendGatewayServer
         GameServerOptions options,
         SessionRegistry sessions,
         PlayPacketDispatcher dispatcher,
-        PlayerJoinFlow joinFlow)
+        PlayerJoinFlow joinFlow,
+        EntityTracker entityTracker)
     {
         _options = options;
         _sessions = sessions;
         _dispatcher = dispatcher;
         _joinFlow = joinFlow;
+        _entityTracker = entityTracker;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -147,6 +151,27 @@ public sealed class BackendGatewayServer
             {
                 _sessions.Remove(session.SessionId, out _);
                 SafeClose(session.Socket);
+
+                // M3: Broadcast entity removal to remaining players
+                if (session.Player != null)
+                {
+                    var entityId = session.Player.EntityId;
+                    var playerId = session.Player.PlayerId;
+                    _entityTracker.RemoveEntity(entityId);
+                    _entityTracker.RemoveObserver(session.SessionId);
+
+                    var destroyPkt = S2CPacketBuilders.BuildDestroyEntities(new[] { entityId });
+                    var listRemove = S2CPacketBuilders.BuildPlayerListItemRemove(playerId);
+                    foreach (var (otherSid, other) in _sessions.All)
+                    {
+                        if (other.State == GameSessionState.Play && !other.Closed)
+                        {
+                            other.EnqueueOutput(destroyPkt);
+                            other.EnqueueOutput(listRemove);
+                        }
+                    }
+                }
+
                 Info("Session", session.SessionId, $"Session closed");
             }
         }
@@ -283,6 +308,7 @@ public sealed class BackendGatewayServer
         var playerName = Encoding.UTF8.GetString(span.Slice(off, nameLen));
 
         session.PlayerId = playerUuid;
+        session.PlayerName = playerName;
 
         Info("BackendGateway", session.SessionId,
             $"Gateway handshake complete, playerId={playerUuid}, playerName={playerName}");

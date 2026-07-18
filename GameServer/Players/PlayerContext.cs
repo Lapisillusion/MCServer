@@ -3,6 +3,7 @@ namespace GameServer.Players;
 public sealed class PlayerContext
 {
     public string PlayerId { get; set; } = string.Empty;
+    public string PlayerName { get; set; } = string.Empty;
     public int EntityId { get; set; }
     public byte Gamemode { get; set; }
     public int Dimension { get; set; }

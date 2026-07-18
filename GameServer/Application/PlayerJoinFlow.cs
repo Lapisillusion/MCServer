@@ -3,6 +3,7 @@ using GameServer.Core.Session;
 using GameServer.Dimension;
 using GameServer.Network;
 using GameServer.Players;
+using GameServer.Replication;
 using GameServer.World;
 using static GameServer.Core.Diagnostics.GameLogger;
 
@@ -22,17 +23,23 @@ public sealed class PlayerJoinFlow
     private readonly SpawnManager _spawnManager;
     private readonly DimensionManager _dimensionManager;
     private readonly GameServerOptions _options;
+    private readonly SessionRegistry _sessions;
+    private readonly EntityTracker _entityTracker;
 
     public PlayerJoinFlow(
         PlayerManager playerManager,
         SpawnManager spawnManager,
         DimensionManager dimensionManager,
-        GameServerOptions options)
+        GameServerOptions options,
+        SessionRegistry sessions,
+        EntityTracker entityTracker)
     {
         _playerManager = playerManager;
         _spawnManager = spawnManager;
         _dimensionManager = dimensionManager;
         _options = options;
+        _sessions = sessions;
+        _entityTracker = entityTracker;
     }
 
     public async Task ExecuteAsync(SessionContext session, CancellationToken ct)
@@ -45,12 +52,14 @@ public sealed class PlayerJoinFlow
 
         // 3. Create player context with unique EntityId
         var player = _playerManager.CreatePlayer(session.PlayerId);
+        player.PlayerName = session.PlayerName;
         player.Dimension = spawn.Dimension;
         player.X = spawn.X;
         player.Y = spawn.Y;
         player.Z = spawn.Z;
         player.Yaw = spawn.Yaw;
         player.Pitch = spawn.Pitch;
+        player.OnGround = true; // standing on superflat grass at Y=4.0
         session.Player = player;
 
         Info("JoinFlow", session.SessionId,
@@ -71,8 +80,8 @@ public sealed class PlayerJoinFlow
             difficulty: 2, maxPlayers: 0, levelType: dimDef.LevelType, reducedDebugInfo: false)));
         frameList.Add(("PluginMessage", S2CPacketBuilders.BuildPluginMessage("MC|Brand", "vanilla")));
         frameList.Add(("ServerDifficulty", S2CPacketBuilders.BuildServerDifficulty(difficulty: 2)));
-        frameList.Add(("PlayerAbilities", S2CPacketBuilders.BuildPlayerAbilities(flags: 0, flyingSpeed: 0.05f, walkingSpeed: 0.1f)));
         frameList.Add(("SpawnPosition", S2CPacketBuilders.BuildSpawnPosition(0, 4, 0)));
+        frameList.Add(("PlayerAbilities", S2CPacketBuilders.BuildPlayerAbilities(flags: 0, flyingSpeed: 0.05f, walkingSpeed: 0.1f)));
         frameList.Add(("PlayerPosAndLook", S2CPacketBuilders.BuildPlayerPositionAndLook(player.X, player.Y, player.Z,
             player.Yaw, player.Pitch, flags: 0, teleportId: player.TeleportId)));
 
@@ -105,5 +114,36 @@ public sealed class PlayerJoinFlow
 
         Info("JoinFlow", session.SessionId,
             $"Join sequence complete, {frames.Length} frames, {totalBytes} total bytes batched, compression={_options.EnableCompression}");
+
+        // 7. Multiplayer: broadcast PlayerListItem to all players.
+        // SpawnPlayer is handled by ReplicationStage (single source of truth for entity visibility).
+        var existingPlayers = 0;
+        foreach (var (otherSid, other) in _sessions.All)
+        {
+            if (other.SessionId == session.SessionId) continue;
+            if (other.State != GameSessionState.Play || other.Closed || other.Player == null) continue;
+
+            existingPlayers++;
+            // Send PlayerListItem(ADD) for new player to existing player
+            var itemAdd = S2CPacketBuilders.BuildPlayerListItemAdd(
+                player.PlayerId, player.PlayerName, gamemode: 0, ping: 0);
+            other.EnqueueOutput(itemAdd);
+        }
+
+        // 8. Multiplayer: send existing players' PlayerListItem to the new player
+        foreach (var (otherSid, other) in _sessions.All)
+        {
+            if (other.SessionId == session.SessionId) continue;
+            if (other.State != GameSessionState.Play || other.Closed || other.Player == null) continue;
+
+            var otherP = other.Player;
+            var itemAdd = S2CPacketBuilders.BuildPlayerListItemAdd(
+                otherP.PlayerId, otherP.PlayerName, gamemode: 0, ping: 0);
+            session.EnqueueOutput(itemAdd);
+        }
+
+        if (existingPlayers > 0)
+            Info("JoinFlow", session.SessionId,
+                $"Multiplayer broadcast: {existingPlayers} existing players notified via PlayerListItem");
     }
 }
