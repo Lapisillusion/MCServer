@@ -1,4 +1,5 @@
 using GameServer.Interactions;
+using GameServer.World;
 using Xunit;
 
 namespace GameServer.Tests;
@@ -45,5 +46,28 @@ public class BlockInteractionServiceTests
         Assert.Equal(expectedX, result.X);
         Assert.Equal(expectedY, result.Y);
         Assert.Equal(expectedZ, result.Z);
+    }
+
+    [Fact]
+    public void ProcessPlace_InvalidFace_DoesNotCreateOrModifyChunk()
+    {
+        var provider = new ChunkProvider();
+        var position = BlockInteractionService.EncodePosition(0, 4, 0);
+
+        var frame = BlockInteractionService.ProcessPlace(provider, position, face: 6, blockState: 48, out var error);
+
+        Assert.Null(frame);
+        Assert.Equal("Invalid block face: 6", error);
+        Assert.False(provider.TryGetColumn(new ChunkPos(0, 0), out _));
+    }
+
+    [Fact]
+    public void IsWithinReach_RejectsDistantTarget()
+    {
+        var near = BlockInteractionService.EncodePosition(0, 4, 0);
+        var distant = BlockInteractionService.EncodePosition(20, 4, 0);
+
+        Assert.True(BlockInteractionService.IsWithinReach(0.5, 4, 0.5, near));
+        Assert.False(BlockInteractionService.IsWithinReach(0.5, 4, 0.5, distant));
     }
 }

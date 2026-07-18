@@ -26,6 +26,13 @@ internal static class BlockInteractionHandlers
         off += 8;
         var face = span[off];
 
+        if (session.Player == null || !BlockInteractionService.IsWithinReach(
+                session.Player.X, session.Player.Y, session.Player.Z, position))
+        {
+            Warn("BlockInteraction", context, "Rejected out-of-reach dig");
+            return ValueTask.CompletedTask;
+        }
+
         var result = BlockInteractionService.ProcessDig(
             HandlerContext.ChunkProvider, position, (byte)status, out var error);
 
@@ -74,10 +81,22 @@ internal static class BlockInteractionHandlers
             return ValueTask.CompletedTask;
         off += 12;
 
-        const int dirtBlockState = 48;
+        if (session.Player == null || hand != 0 || !BlockInteractionService.IsWithinReach(
+                session.Player.X, session.Player.Y, session.Player.Z, position, face))
+        {
+            Warn("BlockInteraction", context, "Rejected invalid or out-of-reach placement");
+            return ValueTask.CompletedTask;
+        }
+
+        var heldItem = session.Player.Hotbar.GetSlot(session.Player.Hotbar.SelectedSlot);
+        if (heldItem == null)
+        {
+            Warn("BlockInteraction", context, "Rejected placement with empty selected hotbar slot");
+            return ValueTask.CompletedTask;
+        }
 
         var result = BlockInteractionService.ProcessPlace(
-            HandlerContext.ChunkProvider, position, face, dirtBlockState, out var error);
+            HandlerContext.ChunkProvider, position, face, heldItem.BlockState, out var error);
 
         if (error != null)
         {
@@ -91,7 +110,14 @@ internal static class BlockInteractionHandlers
 
         if (result != null)
         {
+            // Only consume after the world mutation has succeeded.
+            if (!session.Player.Hotbar.TryConsumeSelectedBlock(out _))
+                throw new InvalidOperationException("Selected item disappeared during placement.");
+
             session.EnqueueOutput(result);
+            var hotbarSlot = session.Player.Hotbar.SelectedSlot;
+            session.EnqueueOutput(S2CPacketBuilders.BuildSetSlot(0, (short)(36 + hotbarSlot),
+                session.Player.Hotbar.GetSlot(hotbarSlot)));
             BroadcastToOthers(session, result);
             var bx = (int)(position >> 38);
             var by = (int)(position << 52 >> 52);

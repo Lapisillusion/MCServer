@@ -1,3 +1,5 @@
+using GameServer.Inventory;
+
 namespace GameServer.Players;
 
 public sealed class PlayerContext
@@ -16,4 +18,5 @@ public sealed class PlayerContext
     public long LastKeepAliveId { get; set; }
     public bool ChunksSent { get; set; }
     public int TeleportId { get; set; } = 1;
+    public HotbarInventory Hotbar { get; } = HotbarInventory.CreateDefault();
 }

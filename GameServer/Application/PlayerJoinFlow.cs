@@ -85,6 +85,13 @@ public sealed class PlayerJoinFlow
         frameList.Add(("PlayerPosAndLook", S2CPacketBuilders.BuildPlayerPositionAndLook(player.X, player.Y, player.Z,
             player.Yaw, player.Pitch, flags: 0, teleportId: player.TeleportId)));
 
+        // M6: establish the server-authoritative starter hotbar before accepting play input.
+        for (var slot = 0; slot < GameServer.Inventory.HotbarInventory.SlotCount; slot++)
+        {
+            var inventorySlot = (short)(36 + slot); // player inventory window: hotbar occupies slots 36..44
+            frameList.Add(($"Hotbar[{slot}]", S2CPacketBuilders.BuildSetSlot(0, inventorySlot, player.Hotbar.GetSlot(slot))));
+        }
+
         var frames = frameList.ToArray();
 
         // 5. Batch all frames into a single write for network efficiency

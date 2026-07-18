@@ -6,6 +6,8 @@ namespace GameServer.Interactions;
 /// </summary>
 public static class BlockInteractionService
 {
+    public const double MaximumInteractionReach = 4.5;
+
     /// <summary>
     /// Decode 1.12.2 packed position (64-bit: 26-bit X, 12-bit Y, 26-bit Z).
     /// </summary>
@@ -41,6 +43,11 @@ public static class BlockInteractionService
             return null;
 
         var (x, y, z) = DecodePosition(encodedPosition);
+        if (y is < 0 or > 255)
+        {
+            error = $"Y out of bounds: {y}";
+            return null;
+        }
 
         var chunkX = x >> 4;
         var chunkZ = z >> 4;
@@ -78,7 +85,13 @@ public static class BlockInteractionService
         var (x, y, z) = DecodePosition(encodedPosition);
 
         // Calculate target position (adjacent to the clicked face)
-        var (tx, ty, tz) = GetAdjacentPosition(x, y, z, face);
+        if (!TryGetAdjacentPosition(x, y, z, face, out var target))
+        {
+            error = $"Invalid block face: {face}";
+            return null;
+        }
+
+        var (tx, ty, tz) = target;
 
         var chunkX = tx >> 4;
         var chunkZ = tz >> 4;
@@ -111,10 +124,27 @@ public static class BlockInteractionService
         return Network.S2CPacketBuilders.BuildBlockChange(tx, ty, tz, blockState);
     }
 
-    /// <summary>Get block position adjacent to (x,y,z) on the specified face.</summary>
-    private static (int X, int Y, int Z) GetAdjacentPosition(int x, int y, int z, int face)
+    /// <summary>Checks a target block against the player's eye position using survival reach.</summary>
+    public static bool IsWithinReach(double playerX, double playerY, double playerZ, long encodedPosition, int? face = null)
     {
-        return face switch
+        var (x, y, z) = DecodePosition(encodedPosition);
+        if (face is int specifiedFace)
+        {
+            if (!TryGetAdjacentPosition(x, y, z, specifiedFace, out var target))
+                return false;
+            (x, y, z) = target;
+        }
+
+        var dx = playerX - (x + 0.5);
+        var dy = (playerY + 1.62) - (y + 0.5);
+        var dz = playerZ - (z + 0.5);
+        return dx * dx + dy * dy + dz * dz <= MaximumInteractionReach * MaximumInteractionReach;
+    }
+
+    /// <summary>Get block position adjacent to (x,y,z) on the specified face.</summary>
+    private static bool TryGetAdjacentPosition(int x, int y, int z, int face, out (int X, int Y, int Z) position)
+    {
+        position = face switch
         {
             0 => (x, y - 1, z), // bottom
             1 => (x, y + 1, z), // top
@@ -122,7 +152,9 @@ public static class BlockInteractionService
             3 => (x, y, z + 1), // south
             4 => (x - 1, y, z), // west
             5 => (x + 1, y, z), // east
-            _ => (x, y, z)
+            _ => default
         };
+
+        return face is >= 0 and <= 5;
     }
 }

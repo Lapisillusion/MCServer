@@ -1,5 +1,6 @@
 using System.Text;
 using Common.MC;
+using GameServer.Inventory;
 
 namespace GameServer.Network;
 
@@ -29,6 +30,8 @@ public static class S2CPacketBuilders
     private const int S2C_EntityLook = Protocol340Ids.PlayS2C.EntityLook;
     private const int S2C_Entity = Protocol340Ids.PlayS2C.Entity;
     private const int S2C_EntityMetadata = Protocol340Ids.PlayS2C.EntityMetadata;
+    private const int S2C_SetSlot = Protocol340Ids.PlayS2C.SetSlot;
+    private const int S2C_HeldItemChange = Protocol340Ids.PlayS2C.HeldItemChange;
 
     /// <summary>Send a complete MC frame to the stream.</summary>
     public static async Task SendPacketAsync(Stream stream, byte[] frame, CancellationToken ct = default)
@@ -176,6 +179,40 @@ public static class S2CPacketBuilders
             McProtocolWriter.WriteVarInt(dst[off..], blockState);
         }, payloadLen);
     }
+
+    /// <summary>
+    /// S2C Set Slot (0x16) for protocol 340. Its Slot Data is the legacy 1.12.2 layout:
+    /// item ID as Short (-1 for empty), then count Byte, damage Short and NBT.
+    /// </summary>
+    public static byte[] BuildSetSlot(byte windowId, short slot, ItemStack? item)
+    {
+        // Empty slot: item ID Short(-1). Present: ID Short + count Byte + damage Short + TAG_End NBT.
+        var itemLength = item == null ? 2 : 2 + 1 + 2 + 1;
+        var payloadLength = 1 + 2 + itemLength;
+        return McProtocolWriter.BuildMcFrame(S2C_SetSlot, dst =>
+        {
+            var off = 0;
+            dst[off++] = windowId;
+            System.Buffers.Binary.BinaryPrimitives.WriteInt16BigEndian(dst[off..], slot);
+            off += 2;
+            if (item == null)
+            {
+                System.Buffers.Binary.BinaryPrimitives.WriteInt16BigEndian(dst[off..], -1);
+                return;
+            }
+
+            System.Buffers.Binary.BinaryPrimitives.WriteInt16BigEndian(dst[off..], checked((short)item.ItemId));
+            off += 2;
+            dst[off++] = checked((byte)item.Count);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt16BigEndian(dst[off..], 0); // item damage / metadata
+            off += 2;
+            dst[off] = 0; // NBT TAG_End
+        }, payloadLength);
+    }
+
+    /// <summary>S2C Held Item Change (0x3A), used to confirm the server-selected hotbar slot.</summary>
+    public static byte[] BuildHeldItemChange(byte slot)
+        => McProtocolWriter.BuildMcFrame(S2C_HeldItemChange, new[] { slot });
 
     /// <summary>
     /// S2C Animation (0x06). Animation types: 0=swing main arm, 1=damage,

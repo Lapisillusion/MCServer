@@ -1,4 +1,5 @@
 using Common.MC;
+using GameServer.Inventory;
 using GameServer.Network;
 using Xunit;
 
@@ -94,5 +95,40 @@ public class S2CPacketBuildersTests
         var frame = S2CPacketBuilders.BuildAnimation(entityId: 1, animationType: 0);
         Assert.NotNull(frame);
         Assert.True(frame.Length > 0);
+    }
+
+    [Fact]
+    public void BuildSetSlot_UsesSetSlotPacketAndEncodesStack()
+    {
+        var frame = S2CPacketBuilders.BuildSetSlot(0, 36, new ItemStack(ItemIds.Dirt, BlockStates.Dirt, 64));
+        var off = 0;
+        Assert.True(VarIntCodec.TryRead(frame, ref off, out _));
+        Assert.True(VarIntCodec.TryRead(frame, ref off, out var packetId));
+
+        Assert.Equal(Protocol340Ids.PlayS2C.SetSlot, packetId);
+        Assert.Equal(0, frame[off]);
+        Assert.Equal(0, frame[off + 1]);
+        Assert.Equal(36, frame[off + 2]);
+        Assert.Equal(0, frame[off + 3]);
+        Assert.Equal(ItemIds.Dirt, frame[off + 4]);
+        Assert.Equal(64, frame[off + 5]);
+        Assert.Equal(0, frame[off + 6]);
+        Assert.Equal(0, frame[off + 7]);
+        Assert.Equal(0, frame[off + 8]);
+    }
+
+    [Fact]
+    public void BuildSetSlot_EmptyStackUsesLegacyMinusOneItemId()
+    {
+        var frame = S2CPacketBuilders.BuildSetSlot(0, 37, null);
+        var off = 0;
+        Assert.True(VarIntCodec.TryRead(frame, ref off, out _));
+        Assert.True(VarIntCodec.TryRead(frame, ref off, out _));
+
+        Assert.Equal(0, frame[off]);
+        Assert.Equal(0, frame[off + 1]);
+        Assert.Equal(37, frame[off + 2]);
+        Assert.Equal(0xFF, frame[off + 3]);
+        Assert.Equal(0xFF, frame[off + 4]);
     }
 }

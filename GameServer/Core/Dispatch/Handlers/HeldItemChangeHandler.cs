@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using GameServer.Core.Diagnostics;
 using GameServer.Core.Session;
+using GameServer.Network;
 using GameServer.Network.Backend;
 using static GameServer.Core.Diagnostics.GameLogger;
 
@@ -20,6 +21,16 @@ internal static class HeldItemChangeHandler
             return ValueTask.CompletedTask;
 
         var slotId = BinaryPrimitives.ReadInt16BigEndian(span[off..]);
+        if (session.Player == null)
+            return ValueTask.CompletedTask;
+
+        if (!session.Player.Hotbar.TrySelect(slotId))
+        {
+            Warn("PlayPacket", context, "Rejected HeldItemChange outside hotbar: {SlotId}", slotId);
+            return ValueTask.CompletedTask;
+        }
+
+        session.EnqueueOutput(S2CPacketBuilders.BuildHeldItemChange((byte)slotId));
         Info("PlayPacket", context,
             "HeldItemChange {SlotId}", slotId);
 
