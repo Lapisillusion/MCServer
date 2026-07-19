@@ -16,7 +16,11 @@ namespace GameServer.Core.Diagnostics;
 /// </summary>
 public static class GameLogger
 {
+    public static bool IsDebugEnabled => Log.IsEnabled(LogEventLevel.Debug);
     // ── Full-context overloads (legacy, kept for backward compat) ──
+
+    public static void Debug(string component, long sessionId, string playerName, string packetId, string message)
+        => WriteLegacy(LogEventLevel.Debug, component, sessionId, playerName, packetId, message);
 
     public static void Info(string component, long sessionId, string playerName, string packetId, string message)
         => WriteLegacy(LogEventLevel.Information, component, sessionId, playerName, packetId, message);
@@ -29,6 +33,9 @@ public static class GameLogger
 
     // ── Session/player overloads (legacy) ────────────────────
 
+    public static void Debug(string component, long sessionId, string playerName, string message)
+        => WriteLegacy(LogEventLevel.Debug, component, sessionId, playerName, null, message);
+
     public static void Info(string component, long sessionId, string playerName, string message)
         => WriteLegacy(LogEventLevel.Information, component, sessionId, playerName, null, message);
 
@@ -37,6 +44,9 @@ public static class GameLogger
 
     public static void Error(string component, long sessionId, string playerName, string message)
         => WriteLegacy(LogEventLevel.Error, component, sessionId, playerName, null, message);
+
+    public static void Debug(string component, long sessionId, string message)
+        => WriteLegacy(LogEventLevel.Debug, component, sessionId, null, null, message);
 
     public static void Info(string component, long sessionId, string message)
         => WriteLegacy(LogEventLevel.Information, component, sessionId, null, null, message);
@@ -49,6 +59,9 @@ public static class GameLogger
 
     // ── Component-only overloads (legacy) ───────────────────
 
+    public static void Debug(string component, string message)
+        => WriteLegacy(LogEventLevel.Debug, component, null, null, null, message);
+
     public static void Info(string component, string message)
         => WriteLegacy(LogEventLevel.Information, component, null, null, null, message);
 
@@ -60,6 +73,9 @@ public static class GameLogger
 
     // ── RuntimeLogContext-based overloads (new) ─────────────
     // These emit the full layered hierarchy as Serilog properties.
+
+    public static void Debug(string module, in RuntimeLogContext ctx, string message, params object[] args)
+        => Write(LogEventLevel.Debug, module, ctx, message, args);
 
     public static void Info(string module, in RuntimeLogContext ctx, string message, params object[] args)
         => Write(LogEventLevel.Information, module, ctx, message, args);

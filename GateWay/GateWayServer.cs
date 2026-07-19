@@ -776,6 +776,9 @@ public sealed class GateWayServer
     private void LogParsedClientPacket(ConnectionContext ctx, ConnState stateBefore, int packetId, int frameLen, int payloadLen,
         object? parsed, bool forwardToBackend)
     {
+        if (!Logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+            return;
+
         var packetName = PacketNameResolver.GetNameOrDefault(packetId);
         var result = new
         {
@@ -791,7 +794,7 @@ public sealed class GateWayServer
             Parsed = parsed
         };
 
-        Logger.Information("Parsed packet {PacketName}, playerName={PlayerName} {@Packet}",
+        Logger.Debug("Parsed packet {PacketName}, playerName={PlayerName} {@Packet}",
             packetName, ctx.PlayerName ?? "-", result);
     }
 

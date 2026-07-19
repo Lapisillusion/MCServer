@@ -1,3 +1,4 @@
+using System.Buffers;
 using GameServer.Core.Dispatch;
 using GameServer.Core.Session;
 using GameServer.Dimension;
@@ -92,7 +93,7 @@ public sealed class PlayerJoinFlow
             $"yaw={player.Yaw:F2}, pitch={player.Pitch:F2}, teleportId={player.TeleportId}");
 
         // 4. Build join frames (6 packets + optional compression)
-        var frameList = new List<(string Name, byte[] Data)>();
+        var frameList = new List<(string Name, byte[] Data)>(16);
 
         if (_options.EnableCompression)
         {
@@ -115,35 +116,42 @@ public sealed class PlayerJoinFlow
             frameList.Add(($"Hotbar[{slot}]", S2CPacketBuilders.BuildSetSlot(0, inventorySlot, player.Hotbar.GetSlot(slot))));
         }
 
-        var frames = frameList.ToArray();
+        var frames = frameList;
 
         // 5. Batch all frames into a single write for network efficiency
         var totalBytes = 0;
         foreach (var (_, data) in frames)
             totalBytes += data.Length;
 
-        var batch = new byte[totalBytes];
-        var offset = 0;
-        for (var i = 0; i < frames.Length; i++)
+        var batch = ArrayPool<byte>.Shared.Rent(totalBytes);
+        try
         {
-            var (name, data) = frames[i];
-            Buffer.BlockCopy(data, 0, batch, offset, data.Length);
-            offset += data.Length;
-            Info("JoinFlow", session.SessionId, session.PlayerName,
-                $"  [{i + 1}/{frames.Length}] {name} ({data.Length} bytes)");
+            var offset = 0;
+            for (var i = 0; i < frames.Count; i++)
+            {
+                var (name, data) = frames[i];
+                Buffer.BlockCopy(data, 0, batch, offset, data.Length);
+                offset += data.Length;
+                Info("JoinFlow", session.SessionId, session.PlayerName,
+                    $"  [{i + 1}/{frames.Count}] {name} ({data.Length} bytes)");
+            }
+
+            if (session.Stream == null)
+                throw new InvalidOperationException("Session stream is not set.");
+
+            await session.Stream.WriteAsync(batch.AsMemory(0, totalBytes), ct);
+            await session.Stream.FlushAsync(ct);
         }
-
-        if (session.Stream == null)
-            throw new InvalidOperationException("Session stream is not set.");
-
-        await session.Stream.WriteAsync(batch, ct);
-        await session.Stream.FlushAsync(ct);
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(batch);
+        }
 
         // 6. Transition to Play
         session.State = GameSessionState.Play;
 
         Info("JoinFlow", session.SessionId, session.PlayerName,
-            $"Join sequence complete, {frames.Length} frames, {totalBytes} total bytes batched, compression={_options.EnableCompression}");
+            $"Join sequence complete, {frames.Count} frames, {totalBytes} total bytes batched, compression={_options.EnableCompression}");
 
         // 7. Multiplayer: broadcast PlayerListItem to all players.
         // SpawnPlayer is handled by ReplicationStage (single source of truth for entity visibility).

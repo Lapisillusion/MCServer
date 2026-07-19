@@ -41,7 +41,7 @@ public sealed class WorldCollisionService
         return false;
     }
 
-    private void AppendCollisionBoxes(in AxisAlignedBox query, List<AxisAlignedBox> destination)
+    public void AppendCollisionBoxes(in AxisAlignedBox query, List<AxisAlignedBox> destination)
     {
         var minX = FloorToLong(query.MinX);
         var maxX = FloorToLong(query.MaxX - AxisAlignedBox.CollisionEpsilon);

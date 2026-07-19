@@ -22,7 +22,7 @@ public static class Program
     public static async Task Main(string[] args)
     {
         Log.Logger = new LoggerConfiguration()
-            .MinimumLevel.Debug()
+            .MinimumLevel.Information()
             .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
             .Enrich.FromLogContext()
             .Enrich.WithProperty("Service", "GameServer")
@@ -43,6 +43,7 @@ public static class Program
             var m0 = M0Bootstrapper.Initialize();
             var options = GameServerOptions.CreateDefault();
             var sessions = new SessionRegistry();
+            var tickMetrics = new TickMetrics(options.TickMetricsWindowSize);
 
             // v0.2.0 — Spawn Pipeline dependencies
             var dimensionManager = new DimensionManager();
@@ -58,19 +59,19 @@ public static class Program
             // v0.2.1 — Chunk Provider (shared storage for generated chunks)
             var chunkProvider = new ChunkProvider();
 
-            var chunkStream = new ChunkStreamService(chunkProvider);
-            var movement = new PlayerMovementService(chunkProvider);
+            var chunkStream = new ChunkStreamService(chunkProvider, options, tickMetrics);
+            var movement = new PlayerMovementService(chunkProvider, tickMetrics);
             var physics = new PlayerPhysicsService(movement);
             var playDispatcher = M1PlayDispatchBootstrap.Build(
                 chunkProvider, sessions, chunkStream, options, movement);
             var server = new BackendGatewayServer(options, sessions, playDispatcher, joinFlow, entityTracker, playerManager, playerDataStore);
 
             // v0.3.2 — Tick Pipeline stages (InputCollect → Simulate → Replication → NetworkFlush)
-            var inputCollect = new InputCollectStage(sessions, playDispatcher);
+            var inputCollect = new InputCollectStage(sessions, playDispatcher, options, tickMetrics);
             var liveness = new SessionLivenessService(options);
             var simulate = new SimulateStage(sessions, liveness, chunkStream, physics);
             var replication = new ReplicationStage(sessions, entityTracker);
-            var networkFlush = new NetworkFlushStage(sessions, options);
+            var networkFlush = new NetworkFlushStage(sessions, options, tickMetrics);
 
             var tickScheduler = new TickScheduler(new ITickStage[]
             {
@@ -78,7 +79,7 @@ public static class Program
                 simulate,
                 replication,
                 networkFlush
-            });
+            }, tickMetrics);
 
             Info("Startup",
                 $"M0 Ready — InternalMessages={m0.InternalMessageCount}, DispatchRoutes={m0.DispatchRouteCount}, TickPhases={m0.TickPhaseCount}");

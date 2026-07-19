@@ -98,6 +98,7 @@ public sealed class BackendGatewayServer
     private async Task RunSessionLoopAsync(SessionContext session, CancellationToken cancellationToken)
     {
         Info("Session", session.SessionId, $"Session opened, remote={session.Socket.RemoteEndPoint}");
+        Task? sendPump = null;
 
         try
         {
@@ -110,6 +111,9 @@ public sealed class BackendGatewayServer
             session.State = GameSessionState.Joining;
 
             await _joinFlow.ExecuteAsync(session, cancellationToken);
+
+            // JoinFlow is the last direct writer. From this point the pump is the sole socket writer.
+            sendPump = RunSendPumpAsync(session, stream, cancellationToken);
 
             Info("Session", session.SessionId, session.PlayerName, "Entering read loop, enqueuing to tick pipeline");
 
@@ -145,6 +149,20 @@ public sealed class BackendGatewayServer
         }
         finally
         {
+            session.CompleteSendQueue();
+            if (sendPump != null)
+            {
+                try
+                {
+                    await sendPump;
+                }
+                catch
+                {
+                    // Send-pump errors already request close and are logged at the source.
+                }
+            }
+            session.DrainPendingSendBatches();
+
             if (session.TryMarkClosed())
             {
                 _sessions.Remove(session.SessionId, out _);
@@ -186,6 +204,44 @@ public sealed class BackendGatewayServer
 
                 Info("Session", session.SessionId, session.PlayerName, $"Session closed, reason={session.CloseReason ?? "normal"}");
             }
+        }
+    }
+
+    private static async Task RunSendPumpAsync(
+        SessionContext session,
+        NetworkStream stream,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (await session.WaitToReadSendBatchAsync(cancellationToken))
+            {
+                while (session.TryReadSendBatch(out var batch) && batch != null)
+                {
+                    try
+                    {
+                        await stream.WriteAsync(batch.Memory, cancellationToken);
+                        await stream.FlushAsync(cancellationToken);
+                    }
+                    finally
+                    {
+                        session.ReleaseSendBatch(batch);
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            Error("SendPump", session.SessionId, session.PlayerName,
+                $"Async socket write failed: {ex.GetType().Name}: {ex.Message}");
+            session.RequestClose($"Send failure: {ex.GetType().Name}");
+        }
+        finally
+        {
+            session.DrainPendingSendBatches();
         }
     }
 

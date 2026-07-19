@@ -1,33 +1,41 @@
 using Common.MC;
+using GameServer.Application;
 using GameServer.Core.Diagnostics;
 using GameServer.Core.Dispatch;
 using GameServer.Core.Session;
+using GameServer.Network;
 using static GameServer.Core.Diagnostics.GameLogger;
 
 namespace GameServer.Tick.Stages;
 
-/// <summary>
-/// Drains each session's input queue and dispatches frames to PlayPacket handlers.
-/// Handlers run on the tick thread and enqueue output via session.EnqueueOutput().
-/// </summary>
+/// <summary>Applies a fair per-session packet budget before dispatching input on the tick thread.</summary>
 public sealed class InputCollectStage : ITickStage
 {
     private readonly SessionRegistry _sessions;
     private readonly PlayPacketDispatcher _dispatcher;
+    private readonly int _maxFramesPerSession;
+    private readonly TickMetrics? _metrics;
 
     public TickPipelineStage Stage => TickPipelineStage.InputCollect;
 
-    public InputCollectStage(SessionRegistry sessions, PlayPacketDispatcher dispatcher)
+    public InputCollectStage(
+        SessionRegistry sessions,
+        PlayPacketDispatcher dispatcher,
+        GameServerOptions? options = null,
+        TickMetrics? metrics = null)
     {
         _sessions = sessions;
         _dispatcher = dispatcher;
+        _maxFramesPerSession = Math.Max(1, (options ?? GameServerOptions.CreateDefault()).MaxInputFramesPerTick);
+        _metrics = metrics;
     }
 
     public async ValueTask ExecuteAsync(long tickNumber, CancellationToken ct)
     {
         foreach (var (sid, session) in _sessions.All)
         {
-            if (session.Closed || session.CloseRequested) continue;
+            if (session.Closed || session.CloseRequested || session.IncomingCount == 0)
+                continue;
 
             var baseContext = RuntimeLogContext.Empty
                 .WithSessionId(sid.ToString())
@@ -35,7 +43,6 @@ public sealed class InputCollectStage : ITickStage
                 .WithTickId(tickNumber)
                 .WithStage(nameof(TickPipelineStage.InputCollect));
 
-            // Propagate Layer 3 entity fields from PlayerContext
             if (session.Player != null)
             {
                 baseContext = baseContext
@@ -45,12 +52,11 @@ public sealed class InputCollectStage : ITickStage
             }
 
             var processed = 0;
-            while (session.TryDequeueInput(out var frame))
+            while (processed < _maxFramesPerSession && session.TryDequeueInput(out var frame))
             {
-                var packetName = PacketNameResolver.GetPlayPacketName(frame.PacketId, isC2S: true);
                 var context = baseContext
                     .WithPacketId($"0x{frame.PacketId:X2}")
-                    .WithPacketName(packetName)
+                    .WithPacketName(PacketNameResolver.GetPlayPacketName(frame.PacketId, isC2S: true))
                     .WithDirection("C2S");
 
                 await _dispatcher.DispatchOrIgnoreAsync(
@@ -58,11 +64,12 @@ public sealed class InputCollectStage : ITickStage
                 processed++;
             }
 
-            if (processed > 32)
+            _metrics?.AddInputFrames(processed);
+            if (session.IncomingCount > 0 && tickNumber % 20 == 0)
+            {
                 Warn("InputCollect", sid, session.PlayerName,
-                    $"Tick #{tickNumber}: processed {processed} frames — input queue backlog");
+                    $"Tick #{tickNumber}: per-player input cap={_maxFramesPerSession}, remaining={session.IncomingCount}");
+            }
         }
     }
-
-    // ── Helpers ────────────────────────────────────────────
 }

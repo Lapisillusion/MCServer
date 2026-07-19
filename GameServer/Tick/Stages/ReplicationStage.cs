@@ -1,26 +1,18 @@
 using GameServer.Core.Dispatch;
 using GameServer.Core.Session;
 using GameServer.Network;
+using GameServer.Players;
 using GameServer.Replication;
-using static GameServer.Core.Diagnostics.GameLogger;
 
 namespace GameServer.Tick.Stages;
 
-/// <summary>
-/// Cross-player entity synchronization. Runs after Simulate and before NetworkFlush.
-/// For each observer, computes visibility changes via EntityTracker and enqueues
-/// SpawnPlayer / DestroyEntities / movement packets via session.EnqueueOutput().
-///
-/// Packet selection for movement:
-///   - First sighting or large delta (>8 blocks): EntityTeleport (0x4C)
-///   - Small delta + look changed: EntityLookAndRelativeMove (0x27)
-///   - Small delta only: EntityRelativeMove (0x26)
-///   - Look changed only: EntityLook (0x28)
-/// </summary>
+/// <summary>Cross-player visibility and movement replication with tick-owned reusable snapshots.</summary>
 public sealed class ReplicationStage : ITickStage
 {
     private readonly SessionRegistry _sessions;
     private readonly EntityTracker _tracker;
+    private readonly List<SessionContext> _active = new();
+    private readonly Dictionary<int, PlayerContext> _playersByEntityId = new();
 
     public TickPipelineStage Stage => TickPipelineStage.Replication;
 
@@ -32,79 +24,73 @@ public sealed class ReplicationStage : ITickStage
 
     public ValueTask ExecuteAsync(long tickNumber, CancellationToken ct)
     {
-        // Build a snapshot of active play sessions
-        var active = new List<SessionContext>();
+        _active.Clear();
+        _playersByEntityId.Clear();
         foreach (var (_, session) in _sessions.All)
         {
-            if (!session.Closed && !session.CloseRequested && session.State == GameSessionState.Play && session.Player != null)
-                active.Add(session);
+            if (session.Closed || session.CloseRequested ||
+                session.State != GameSessionState.Play || session.Player == null)
+                continue;
+
+            _active.Add(session);
+            _playersByEntityId[session.Player.EntityId] = session.Player;
         }
 
-        if (active.Count <= 1)
-            return ValueTask.CompletedTask; // nothing to replicate with only 1 player
+        if (_active.Count <= 1)
+            return ValueTask.CompletedTask;
 
-        var activeReadOnly = (IReadOnlyList<SessionContext>)active;
-
-        foreach (var observer in active)
+        foreach (var observer in _active)
         {
-            var result = _tracker.UpdateVisibility(observer, activeReadOnly);
-            if (result.IsEmpty) continue;
+            var result = _tracker.UpdateVisibility(observer, _active, _playersByEntityId);
+            if (result.IsEmpty)
+                continue;
 
-            // ── Despawn entities no longer visible ──────────
             if (result.Despawned.Count > 0)
-            {
-                var destroyPacket = S2CPacketBuilders.BuildDestroyEntities(result.Despawned.ToArray());
-                observer.EnqueueOutput(destroyPacket);
-            }
+                observer.EnqueueOutput(S2CPacketBuilders.BuildDestroyEntities(result.Despawned));
 
-            // ── Spawn newly visible player entities ─────────
             foreach (var player in result.Spawned)
             {
-                var yawByte = AngleToByte(player.Yaw);
-                var pitchByte = AngleToByte(player.Pitch);
-                var spawnPacket = S2CPacketBuilders.BuildSpawnPlayer(
+                observer.EnqueueOutput(S2CPacketBuilders.BuildSpawnPlayer(
                     player.EntityId, player.PlayerId, player.X, player.Y, player.Z,
-                    yawByte, pitchByte);
-                observer.EnqueueOutput(spawnPacket);
+                    AngleToByte(player.Yaw), AngleToByte(player.Pitch)));
             }
 
-            // ── Movement updates for tracked entities ───────
             foreach (var move in result.Moved)
             {
-                var p = move.Player;
+                var player = move.Player;
                 if (move.IsTeleport)
                 {
-                    var tp = S2CPacketBuilders.BuildEntityTeleport(
-                        p.EntityId, p.X, p.Y, p.Z, p.Yaw, p.Pitch, p.OnGround);
-                    observer.EnqueueOutput(tp);
+                    observer.EnqueueOutput(S2CPacketBuilders.BuildEntityTeleport(
+                        player.EntityId, player.X, player.Y, player.Z,
+                        player.Yaw, player.Pitch, player.OnGround));
+                    continue;
                 }
-                else if (move.Last != null)
-                {
-                    var last = move.Last.Value;
-                    var dx = S2CPacketBuilders.EncodeDelta(p.X, last.X);
-                    var dy = S2CPacketBuilders.EncodeDelta(p.Y, last.Y);
-                    var dz = S2CPacketBuilders.EncodeDelta(p.Z, last.Z);
-                    var lookChanged = Math.Abs(p.Yaw - last.Yaw) >= 1f || Math.Abs(p.Pitch - last.Pitch) >= 1f;
 
-                    if (lookChanged && (dx != 0 || dy != 0 || dz != 0))
-                    {
-                        var pkt = S2CPacketBuilders.BuildEntityLookAndRelativeMove(
-                            p.EntityId, dx, dy, dz,
-                            AngleToByte(p.Yaw), AngleToByte(p.Pitch), p.OnGround);
-                        observer.EnqueueOutput(pkt);
-                    }
-                    else if (dx != 0 || dy != 0 || dz != 0)
-                    {
-                        var pkt = S2CPacketBuilders.BuildEntityRelativeMove(
-                            p.EntityId, dx, dy, dz, p.OnGround);
-                        observer.EnqueueOutput(pkt);
-                    }
-                    else if (lookChanged)
-                    {
-                        var pkt = S2CPacketBuilders.BuildEntityLook(
-                            p.EntityId, AngleToByte(p.Yaw), AngleToByte(p.Pitch), p.OnGround);
-                        observer.EnqueueOutput(pkt);
-                    }
+                if (move.Last == null)
+                    continue;
+
+                var last = move.Last.Value;
+                var dx = S2CPacketBuilders.EncodeDelta(player.X, last.X);
+                var dy = S2CPacketBuilders.EncodeDelta(player.Y, last.Y);
+                var dz = S2CPacketBuilders.EncodeDelta(player.Z, last.Z);
+                var lookChanged = Math.Abs(player.Yaw - last.Yaw) >= 1f ||
+                                  Math.Abs(player.Pitch - last.Pitch) >= 1f;
+
+                if (lookChanged && (dx != 0 || dy != 0 || dz != 0))
+                {
+                    observer.EnqueueOutput(S2CPacketBuilders.BuildEntityLookAndRelativeMove(
+                        player.EntityId, dx, dy, dz,
+                        AngleToByte(player.Yaw), AngleToByte(player.Pitch), player.OnGround));
+                }
+                else if (dx != 0 || dy != 0 || dz != 0)
+                {
+                    observer.EnqueueOutput(S2CPacketBuilders.BuildEntityRelativeMove(
+                        player.EntityId, dx, dy, dz, player.OnGround));
+                }
+                else if (lookChanged)
+                {
+                    observer.EnqueueOutput(S2CPacketBuilders.BuildEntityLook(
+                        player.EntityId, AngleToByte(player.Yaw), AngleToByte(player.Pitch), player.OnGround));
                 }
             }
         }
@@ -112,11 +98,11 @@ public sealed class ReplicationStage : ITickStage
         return ValueTask.CompletedTask;
     }
 
-    /// <summary>Convert float angle (degrees) to protocol byte (0-255).</summary>
     private static byte AngleToByte(float angle)
     {
         var wrapped = angle % 360f;
-        if (wrapped < 0) wrapped += 360f;
+        if (wrapped < 0)
+            wrapped += 360f;
         return (byte)(wrapped * 256f / 360f);
     }
 }

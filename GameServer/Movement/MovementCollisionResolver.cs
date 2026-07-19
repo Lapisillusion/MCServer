@@ -1,4 +1,6 @@
-﻿namespace GameServer.Movement;
+﻿using GameServer.Tick;
+
+namespace GameServer.Movement;
 
 public readonly record struct MovementResolution(
     AxisAlignedBox BoundingBox,
@@ -20,15 +22,18 @@ public readonly record struct MovementResolution(
     public bool WasClipped => CollidedHorizontally || CollidedVertically;
 }
 
-/// <summary>Vanilla-style Y → X → Z axis clipping against block collision boxes.</summary>
+/// <summary>Vanilla-style Y → X → Z clipping with a reusable obstacle buffer.</summary>
 public sealed class MovementCollisionResolver
 {
     private const double GroundProbeDistance = 1.0E-3;
     private readonly WorldCollisionService _world;
+    private readonly TickMetrics? _metrics;
+    private readonly List<AxisAlignedBox> _obstacleScratch = new(32);
 
-    public MovementCollisionResolver(WorldCollisionService world)
+    public MovementCollisionResolver(WorldCollisionService world, TickMetrics? metrics = null)
     {
         _world = world;
+        _metrics = metrics;
     }
 
     public MovementResolution Resolve(
@@ -37,22 +42,24 @@ public sealed class MovementCollisionResolver
         double requestedY,
         double requestedZ)
     {
-        var obstacles = _world.GetCollisionBoxes(
-            original.ExpandTowards(requestedX, requestedY, requestedZ));
+        _obstacleScratch.Clear();
+        _world.AppendCollisionBoxes(
+            original.ExpandTowards(requestedX, requestedY, requestedZ), _obstacleScratch);
+        _metrics?.AddCollisionQueries();
 
         var box = original;
         var resolvedY = requestedY;
-        foreach (var obstacle in obstacles)
+        foreach (var obstacle in _obstacleScratch)
             resolvedY = obstacle.ClipYOffset(box, resolvedY);
         box = box.Offset(0, resolvedY, 0);
 
         var resolvedX = requestedX;
-        foreach (var obstacle in obstacles)
+        foreach (var obstacle in _obstacleScratch)
             resolvedX = obstacle.ClipXOffset(box, resolvedX);
         box = box.Offset(resolvedX, 0, 0);
 
         var resolvedZ = requestedZ;
-        foreach (var obstacle in obstacles)
+        foreach (var obstacle in _obstacleScratch)
             resolvedZ = obstacle.ClipZOffset(box, resolvedZ);
         box = box.Offset(0, 0, resolvedZ);
 
@@ -68,5 +75,8 @@ public sealed class MovementCollisionResolver
     }
 
     public bool IsOnGround(in AxisAlignedBox box)
-        => _world.HasCollision(box.Offset(0, -GroundProbeDistance, 0));
+    {
+        _metrics?.AddCollisionQueries();
+        return _world.HasCollision(box.Offset(0, -GroundProbeDistance, 0));
+    }
 }

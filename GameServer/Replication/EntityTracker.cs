@@ -5,170 +5,164 @@ using GameServer.Players;
 namespace GameServer.Replication;
 
 /// <summary>
-/// Tracks entity visibility per observer. For each observer session,
-/// maintains the set of visible entity IDs and their last-known positions.
-/// Each tick, the ReplicationStage calls UpdateVisibility() to compute
-/// which entities to spawn, despawn, or update for each observer.
-///
-/// Visibility rules:
-/// - Same dimension only
-/// - Within ViewDistance blocks (Euclidean, horizontal+vertical)
-/// - Observer session must be in Play state
+/// Tick-thread-owned player visibility tracker. Per-observer scratch collections are retained and
+/// cleared between ticks, avoiding the previous per-observer List/HashSet/ToArray allocation chain.
 /// </summary>
 public sealed class EntityTracker
 {
-    /// <summary>Horizontal+vertical view distance in blocks.</summary>
-    private const double ViewDistance = 64.0;
-    private const double ViewDistanceSq = ViewDistance * ViewDistance;
-
-    /// <summary>Minimum position delta (blocks) to trigger a move update.</summary>
+    private const double ViewDistanceSq = 64.0 * 64.0;
     private const double MinMoveDelta = 0.01;
-
-    /// <summary>Minimum yaw/pitch delta (degrees) to trigger a look update.</summary>
     private const float MinLookDelta = 1.0f;
+    private const double TeleportThresholdSq = 8.0 * 8.0;
 
-    /// <summary>If the delta exceeds this many blocks, use EntityTeleport instead of EntityRelativeMove.</summary>
-    private const double TeleportThreshold = 8.0;
-
-    private readonly Dictionary<long, HashSet<int>> _visible = new();
+    private readonly Dictionary<long, ObserverState> _observers = new();
     private readonly Dictionary<(long ObserverId, int EntityId), LastKnownState> _lastKnown = new();
+    private readonly Dictionary<int, PlayerContext> _lookupScratch = new();
+    private readonly List<(long ObserverId, int EntityId)> _keyScratch = new();
 
-    // ── Public API ─────────────────────────────────────────
-
-    /// <summary>
-    /// Compute visibility changes for a single observer against all active players.
-    /// Returns lists of entity IDs to spawn, despawn, and entities with position deltas
-    /// (including newly-spawned entities as large deltas so the first packet is a teleport).
-    /// </summary>
     public VisibilityResult UpdateVisibility(
         SessionContext observer,
         IReadOnlyList<SessionContext> allSessions)
     {
-        if (observer.Player == null)
+        _lookupScratch.Clear();
+        foreach (var session in allSessions)
+        {
+            if (session.Player != null)
+                _lookupScratch[session.Player.EntityId] = session.Player;
+        }
+        return UpdateVisibility(observer, allSessions, _lookupScratch);
+    }
+
+    public VisibilityResult UpdateVisibility(
+        SessionContext observer,
+        IReadOnlyList<SessionContext> allSessions,
+        IReadOnlyDictionary<int, PlayerContext> playersByEntityId)
+    {
+        var observerPlayer = observer.Player;
+        if (observerPlayer == null)
             return VisibilityResult.Empty;
 
-        var spawned = new List<PlayerContext>();
-        var despawned = new List<int>();
-        var moved = new List<MoveEntry>();
-
-        // Ensure the observer has a visibility set
-        if (!_visible.TryGetValue(observer.SessionId, out var visibleSet))
+        if (!_observers.TryGetValue(observer.SessionId, out var state))
         {
-            visibleSet = new HashSet<int>();
-            _visible[observer.SessionId] = visibleSet;
+            state = new ObserverState();
+            _observers.Add(observer.SessionId, state);
         }
 
-        // Build the set of currently visible entities
-        var currentVisible = new HashSet<int>();
+        state.ClearScratch();
+        var visibleSet = state.Visible;
+        var currentVisible = state.CurrentVisible;
 
         foreach (var other in allSessions)
         {
-            if (other.SessionId == observer.SessionId) continue;
-            if (other.State != GameSessionState.Play) continue;
-            if (other.Closed) continue;
-            if (other.Player == null) continue;
+            var otherPlayer = other.Player;
+            if (other.SessionId == observer.SessionId ||
+                other.State != GameSessionState.Play || other.Closed || other.CloseRequested ||
+                otherPlayer == null || observerPlayer.Dimension != otherPlayer.Dimension)
+                continue;
 
-            // Dimension check
-            if (observer.Player.Dimension != other.Player.Dimension) continue;
-
-            // Distance check
-            var dx = observer.Player.X - other.Player.X;
-            var dy = observer.Player.Y - other.Player.Y;
-            var dz = observer.Player.Z - other.Player.Z;
+            var dx = observerPlayer.X - otherPlayer.X;
+            var dy = observerPlayer.Y - otherPlayer.Y;
+            var dz = observerPlayer.Z - otherPlayer.Z;
             var distSq = dx * dx + dy * dy + dz * dz;
-            if (distSq > ViewDistanceSq) continue;
+            if (distSq > ViewDistanceSq)
+                continue;
 
-            currentVisible.Add(other.Player.EntityId);
-
-            // Check if newly visible
-            if (!visibleSet.Contains(other.Player.EntityId))
+            var entityId = otherPlayer.EntityId;
+            currentVisible.Add(entityId);
+            if (visibleSet.Add(entityId))
             {
-                spawned.Add(other.Player);
-                visibleSet.Add(other.Player.EntityId);
+                state.Spawned.Add(otherPlayer);
+                continue;
+            }
+
+            var key = (observer.SessionId, entityId);
+            if (_lastKnown.TryGetValue(key, out var last))
+            {
+                var positionDelta = Math.Abs(otherPlayer.X - last.X) +
+                                    Math.Abs(otherPlayer.Y - last.Y) +
+                                    Math.Abs(otherPlayer.Z - last.Z);
+                var lookDelta = Math.Abs(otherPlayer.Yaw - last.Yaw) +
+                                Math.Abs(otherPlayer.Pitch - last.Pitch);
+                if (positionDelta >= MinMoveDelta || lookDelta >= MinLookDelta)
+                    state.Moved.Add(new MoveEntry(otherPlayer, last, distSq > TeleportThresholdSq));
             }
             else
             {
-                // Compute delta from last-known position
-                var key = (observer.SessionId, other.Player.EntityId);
-                if (_lastKnown.TryGetValue(key, out var last))
-                {
-                    var d = Math.Abs(other.Player.X - last.X) +
-                            Math.Abs(other.Player.Y - last.Y) +
-                            Math.Abs(other.Player.Z - last.Z);
-                    var dr = Math.Abs(other.Player.Yaw - last.Yaw) +
-                             Math.Abs(other.Player.Pitch - last.Pitch);
-
-                    if (d >= MinMoveDelta || dr >= MinLookDelta)
-                    {
-                        moved.Add(new MoveEntry(other.Player, last,
-                            Math.Sqrt(dx * dx + dy * dy + dz * dz) > TeleportThreshold));
-                    }
-                }
-                else
-                {
-                    // First time tracking — send full teleport
-                    moved.Add(new MoveEntry(other.Player, null, IsTeleport: true));
-                }
+                state.Moved.Add(new MoveEntry(otherPlayer, null, IsTeleport: true));
             }
         }
 
-        // Find despawned (were visible, no longer are)
-        foreach (var entityId in visibleSet.ToArray())
+        foreach (var entityId in visibleSet)
         {
             if (!currentVisible.Contains(entityId))
-            {
-                despawned.Add(entityId);
-                visibleSet.Remove(entityId);
-                _lastKnown.Remove((observer.SessionId, entityId));
-            }
+                state.Despawned.Add(entityId);
         }
 
-        // Record positions for all currently visible
-        foreach (var entityId in currentVisible)
-        {
-            // Find the player context for this entity
-            PlayerContext? playerCtx = null;
-            foreach (var s in allSessions)
-            {
-                if (s.Player?.EntityId == entityId)
-                {
-                    playerCtx = s.Player;
-                    break;
-                }
-            }
-            if (playerCtx != null)
-            {
-                _lastKnown[(observer.SessionId, entityId)] = new LastKnownState(
-                    playerCtx.X, playerCtx.Y, playerCtx.Z,
-                    playerCtx.Yaw, playerCtx.Pitch, playerCtx.OnGround);
-            }
-        }
-
-        return new VisibilityResult(spawned, despawned, moved);
-    }
-
-    /// <summary>Clean up all tracking data for a disconnected observer.</summary>
-    public void RemoveObserver(long sessionId)
-    {
-        _visible.Remove(sessionId);
-        var keys = _lastKnown.Keys.Where(k => k.ObserverId == sessionId).ToArray();
-        foreach (var key in keys)
-            _lastKnown.Remove(key);
-    }
-
-    /// <summary>Clean up tracking data for a disconnected player entity.</summary>
-    public void RemoveEntity(int entityId)
-    {
-        foreach (var (observerId, visibleSet) in _visible)
+        foreach (var entityId in state.Despawned)
         {
             visibleSet.Remove(entityId);
+            _lastKnown.Remove((observer.SessionId, entityId));
         }
-        var keys = _lastKnown.Keys.Where(k => k.EntityId == entityId).ToArray();
-        foreach (var key in keys)
-            _lastKnown.Remove(key);
+
+        foreach (var entityId in currentVisible)
+        {
+            if (playersByEntityId.TryGetValue(entityId, out var player))
+            {
+                _lastKnown[(observer.SessionId, entityId)] = new LastKnownState(
+                    player.X, player.Y, player.Z,
+                    player.Yaw, player.Pitch, player.OnGround);
+            }
+        }
+
+        return new VisibilityResult(state.Spawned, state.Despawned, state.Moved);
     }
 
-    // ── Types ──────────────────────────────────────────────
+    public void RemoveObserver(long sessionId)
+    {
+        _observers.Remove(sessionId);
+        _keyScratch.Clear();
+        foreach (var key in _lastKnown.Keys)
+        {
+            if (key.ObserverId == sessionId)
+                _keyScratch.Add(key);
+        }
+        foreach (var key in _keyScratch)
+            _lastKnown.Remove(key);
+        _keyScratch.Clear();
+    }
+
+    public void RemoveEntity(int entityId)
+    {
+        foreach (var state in _observers.Values)
+            state.Visible.Remove(entityId);
+
+        _keyScratch.Clear();
+        foreach (var key in _lastKnown.Keys)
+        {
+            if (key.EntityId == entityId)
+                _keyScratch.Add(key);
+        }
+        foreach (var key in _keyScratch)
+            _lastKnown.Remove(key);
+        _keyScratch.Clear();
+    }
+
+    private sealed class ObserverState
+    {
+        public HashSet<int> Visible { get; } = new();
+        public HashSet<int> CurrentVisible { get; } = new();
+        public List<PlayerContext> Spawned { get; } = new();
+        public List<int> Despawned { get; } = new();
+        public List<MoveEntry> Moved { get; } = new();
+
+        public void ClearScratch()
+        {
+            CurrentVisible.Clear();
+            Spawned.Clear();
+            Despawned.Clear();
+            Moved.Clear();
+        }
+    }
 
     public readonly record struct LastKnownState(
         double X, double Y, double Z, float Yaw, float Pitch, bool OnGround);
@@ -183,7 +177,10 @@ public sealed class EntityTracker
         List<int> Despawned,
         List<MoveEntry> Moved)
     {
+        private static readonly VisibilityResult EmptyResult =
+            new(new List<PlayerContext>(0), new List<int>(0), new List<MoveEntry>(0));
+
         public bool IsEmpty => Spawned.Count == 0 && Despawned.Count == 0 && Moved.Count == 0;
-        public static VisibilityResult Empty => new(new List<PlayerContext>(), new List<int>(), new List<MoveEntry>());
+        public static VisibilityResult Empty => EmptyResult;
     }
 }

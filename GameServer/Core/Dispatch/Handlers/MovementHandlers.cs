@@ -22,9 +22,12 @@ internal static class MovementHandlers
 
         var clientOnGround = span[off] != 0;
         var serverOnGround = HandlerContext.Movement.RefreshGroundState(session.Player);
-        Info("Movement", context,
-            "Ground state client={ClientOnGround} server={ServerOnGround}",
-            clientOnGround, serverOnGround);
+        if (IsDebugEnabled)
+        {
+            Debug("Movement", context,
+                "Ground state client={ClientOnGround} server={ServerOnGround}",
+                clientOnGround, serverOnGround);
+        }
         return ValueTask.CompletedTask;
     }
 
@@ -116,9 +119,12 @@ internal static class MovementHandlers
         player.Yaw = yaw;
         player.Pitch = pitch;
         var serverOnGround = HandlerContext.Movement.RefreshGroundState(player);
-        Info("Movement", context,
-            "PlayerLook yaw={Yaw:F2} pitch={Pitch:F2} clientGround={ClientOnGround} serverGround={ServerOnGround}",
-            yaw, pitch, clientOnGround, serverOnGround);
+        if (IsDebugEnabled)
+        {
+            Debug("Movement", context,
+                "PlayerLook yaw={Yaw:F2} pitch={Pitch:F2} clientGround={ClientOnGround} serverGround={ServerOnGround}",
+                yaw, pitch, clientOnGround, serverOnGround);
+        }
         return ValueTask.CompletedTask;
     }
 
@@ -177,11 +183,14 @@ internal static class MovementHandlers
             return;
         }
 
-        Info("Movement", context,
-            "{PacketName} accepted pos=({X:F3},{Y:F3},{Z:F3}) clientGround={ClientOnGround} serverGround={ServerOnGround}",
-            packetName,
-            result.X, result.Y, result.Z,
-            clientOnGround, player.OnGround);
+        if (IsDebugEnabled)
+        {
+            Debug("Movement", context,
+                "{PacketName} accepted pos=({X:F3},{Y:F3},{Z:F3}) clientGround={ClientOnGround} serverGround={ServerOnGround}",
+                packetName,
+                result.X, result.Y, result.Z,
+                clientOnGround, player.OnGround);
+        }
     }
 
     private static void RejectAndCorrect(

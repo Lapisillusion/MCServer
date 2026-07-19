@@ -1,20 +1,29 @@
+using GameServer.Application;
 using GameServer.Core.Session;
 using GameServer.Network;
+using GameServer.Tick;
 using static GameServer.Core.Diagnostics.GameLogger;
 
 namespace GameServer.World;
 
-/// <summary>
-/// Reconciles each player's desired chunk view with the chunks already sent to that client.
-/// Chunk data is generated/cached by ChunkProvider and all frames are queued for NetworkFlush.
-/// </summary>
+/// <summary>Budgeted per-player chunk-view reconciliation using tick-owned reusable scratch collections.</summary>
 public sealed class ChunkStreamService
 {
     private readonly ChunkProvider _chunkProvider;
+    private readonly int _maxLoadsPerTick;
+    private readonly TickMetrics? _metrics;
+    private readonly List<ChunkPos> _desiredOrdered = new(81);
+    private readonly HashSet<ChunkPos> _desired = new();
+    private readonly List<ChunkPos> _unloadScratch = new(32);
 
-    public ChunkStreamService(ChunkProvider chunkProvider)
+    public ChunkStreamService(
+        ChunkProvider chunkProvider,
+        GameServerOptions? options = null,
+        TickMetrics? metrics = null)
     {
         _chunkProvider = chunkProvider;
+        _maxLoadsPerTick = Math.Max(1, (options ?? GameServerOptions.CreateDefault()).MaxChunkLoadsPerTick);
+        _metrics = metrics;
     }
 
     public ChunkViewUpdate InitializeView(SessionContext session)
@@ -26,7 +35,6 @@ public sealed class ChunkStreamService
         return UpdateView(session, force: true);
     }
 
-    /// <summary>Updates the player's view only when its center chunk or requested radius changed.</summary>
     public ChunkViewUpdate UpdateView(SessionContext session, bool force = false)
     {
         var player = session.Player;
@@ -36,19 +44,18 @@ public sealed class ChunkStreamService
         var view = player.ChunkView;
         var center = ChunkPos.FromWorldPosition(player.X, player.Z);
         var radius = view.RequestedRadius;
-
         if (!force && view.Center == center && view.AppliedRadius == radius)
             return ChunkViewUpdate.Empty;
 
-        var desiredOrdered = BuildDesiredPositions(center, radius);
-        var desired = desiredOrdered.ToHashSet();
+        BuildDesiredPositions(center, radius, _desiredOrdered, _desired);
         var loaded = 0;
         var unloaded = 0;
         var totalBytes = 0;
 
-        // Load first so crossing a border does not briefly expose void at the leading edge.
-        foreach (var pos in desiredOrdered)
+        foreach (var pos in _desiredOrdered)
         {
+            if (loaded >= _maxLoadsPerTick)
+                break;
             if (view.Contains(pos))
                 continue;
 
@@ -62,7 +69,13 @@ public sealed class ChunkStreamService
             totalBytes += packet.Length;
         }
 
-        foreach (var pos in view.LoadedChunks.Where(pos => !desired.Contains(pos)).ToArray())
+        _unloadScratch.Clear();
+        foreach (var pos in view.LoadedChunks)
+        {
+            if (!_desired.Contains(pos))
+                _unloadScratch.Add(pos);
+        }
+        foreach (var pos in _unloadScratch)
         {
             session.EnqueueOutput(S2CPacketBuilders.BuildUnloadChunk(pos.X, pos.Z));
             view.Remove(pos);
@@ -70,12 +83,14 @@ public sealed class ChunkStreamService
         }
 
         view.Center = center;
-        view.AppliedRadius = radius;
+        view.AppliedRadius = view.LoadedChunks.Count == _desired.Count ? radius : -1;
+        _metrics?.AddChunks(loaded, unloaded);
 
-        if (loaded > 0 || unloaded > 0)
+        if (IsDebugEnabled && (loaded > 0 || unloaded > 0))
         {
-            Info("ChunkStream", session.SessionId, session.PlayerName,
-                $"View reconciled center={center}, radius={radius}, loaded={loaded}, unloaded={unloaded}, resident={view.LoadedChunks.Count}, chunkBytes={totalBytes}");
+            Debug("ChunkStream", session.SessionId, session.PlayerName,
+                $"View step center={center}, radius={radius}, loaded={loaded}/{_maxLoadsPerTick}, " +
+                $"unloaded={unloaded}, resident={view.LoadedChunks.Count}/{_desired.Count}, chunkBytes={totalBytes}");
         }
 
         return new ChunkViewUpdate(center, radius, loaded, unloaded, totalBytes);
@@ -92,30 +107,34 @@ public sealed class ChunkStreamService
             foreach (var pos in view.LoadedChunks)
                 session.EnqueueOutput(S2CPacketBuilders.BuildUnloadChunk(pos.X, pos.Z));
         }
-
         view.Clear();
     }
 
-    private static List<ChunkPos> BuildDesiredPositions(ChunkPos center, int radius)
+    private static void BuildDesiredPositions(
+        ChunkPos center,
+        int radius,
+        List<ChunkPos> ordered,
+        HashSet<ChunkPos> desired)
     {
-        var result = new List<ChunkPos>((radius * 2 + 1) * (radius * 2 + 1));
-        for (var dz = -radius; dz <= radius; dz++)
-        {
-            for (var dx = -radius; dx <= radius; dx++)
-                result.Add(new ChunkPos(center.X + dx, center.Z + dz));
-        }
+        ordered.Clear();
+        desired.Clear();
+        var expected = (radius * 2 + 1) * (radius * 2 + 1);
+        ordered.EnsureCapacity(expected);
+        desired.EnsureCapacity(expected);
 
-        // Center and inner rings are sent first for faster first-paint on the client.
-        result.Sort((a, b) =>
+        // Emit center and successive square rings. Within each ring preserve X/Z ordering.
+        for (var ring = 0; ring <= radius; ring++)
         {
-            var ar = Math.Max(Math.Abs(a.X - center.X), Math.Abs(a.Z - center.Z));
-            var br = Math.Max(Math.Abs(b.X - center.X), Math.Abs(b.Z - center.Z));
-            var ring = ar.CompareTo(br);
-            if (ring != 0) return ring;
-            var x = a.X.CompareTo(b.X);
-            return x != 0 ? x : a.Z.CompareTo(b.Z);
-        });
-        return result;
+            for (var x = center.X - ring; x <= center.X + ring; x++)
+            for (var z = center.Z - ring; z <= center.Z + ring; z++)
+            {
+                if (Math.Max(Math.Abs(x - center.X), Math.Abs(z - center.Z)) != ring)
+                    continue;
+                var pos = new ChunkPos(x, z);
+                ordered.Add(pos);
+                desired.Add(pos);
+            }
+        }
     }
 
     public readonly record struct ChunkViewUpdate(

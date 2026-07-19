@@ -334,19 +334,22 @@ public static class S2CPacketBuilders
 
     /// <summary>S2C Destroy Entities (0x32). Removes entities by ID from the client.</summary>
     public static byte[] BuildDestroyEntities(int[] entityIds)
+        => BuildDestroyEntities((IReadOnlyList<int>)entityIds);
+
+    public static byte[] BuildDestroyEntities(IReadOnlyList<int> entityIds)
     {
-        var countLen = McProtocolWriter.GetVarIntLength(entityIds.Length);
+        var countLen = McProtocolWriter.GetVarIntLength(entityIds.Count);
         var idsLen = 0;
-        foreach (var id in entityIds)
-            idsLen += McProtocolWriter.GetVarIntLength(id);
+        for (var i = 0; i < entityIds.Count; i++)
+            idsLen += McProtocolWriter.GetVarIntLength(entityIds[i]);
 
         var payloadLen = countLen + idsLen;
         return McProtocolWriter.BuildMcFrame(S2C_DestroyEntities, dst =>
         {
             var off = 0;
-            off += McProtocolWriter.WriteVarInt(dst[off..], entityIds.Length);
-            foreach (var id in entityIds)
-                off += McProtocolWriter.WriteVarInt(dst[off..], id);
+            off += McProtocolWriter.WriteVarInt(dst[off..], entityIds.Count);
+            for (var i = 0; i < entityIds.Count; i++)
+                off += McProtocolWriter.WriteVarInt(dst[off..], entityIds[i]);
         }, payloadLen);
     }
 

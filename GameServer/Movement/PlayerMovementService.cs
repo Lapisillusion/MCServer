@@ -1,7 +1,8 @@
-using GameServer.Core.Session;
+﻿using GameServer.Core.Session;
 using GameServer.Network;
 using GameServer.Players;
 using GameServer.World;
+using GameServer.Tick;
 
 namespace GameServer.Movement;
 
@@ -19,8 +20,8 @@ public sealed class PlayerMovementService
 {
     private readonly MovementCollisionResolver _resolver;
 
-    public PlayerMovementService(ChunkProvider chunks)
-        : this(new MovementCollisionResolver(new WorldCollisionService(chunks)))
+    public PlayerMovementService(ChunkProvider chunks, TickMetrics? metrics = null)
+        : this(new MovementCollisionResolver(new WorldCollisionService(chunks), metrics))
     {
     }
 

@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using Common.MC;
+using GameServer.Application;
 using GameServer.Core.Dispatch;
 using GameServer.Core.Session;
 using GameServer.Players;
@@ -15,7 +16,7 @@ public class ChunkStreamServiceTests
     {
         using var socket = CreateSocket();
         var session = CreateSession(socket, x: 160.5, z: -32.1, radius: 1);
-        var service = new ChunkStreamService(new ChunkProvider());
+        var service = CreateService(maxLoadsPerTick: 128);
 
         var update = service.InitializeView(session);
 
@@ -31,7 +32,7 @@ public class ChunkStreamServiceTests
     {
         using var socket = CreateSocket();
         var session = CreateSession(socket, x: 0.5, z: 0.5, radius: 1);
-        var service = new ChunkStreamService(new ChunkProvider());
+        var service = CreateService(maxLoadsPerTick: 128);
         service.InitializeView(session);
         session.DrainAllOutput();
 
@@ -52,7 +53,7 @@ public class ChunkStreamServiceTests
     {
         using var socket = CreateSocket();
         var session = CreateSession(socket, x: 0.5, z: 0.5, radius: 1);
-        var service = new ChunkStreamService(new ChunkProvider());
+        var service = CreateService(maxLoadsPerTick: 128);
         service.InitializeView(session);
         session.DrainAllOutput();
 
@@ -69,7 +70,7 @@ public class ChunkStreamServiceTests
     {
         using var socket = CreateSocket();
         var session = CreateSession(socket, x: 0.5, z: 0.5, radius: 1);
-        var service = new ChunkStreamService(new ChunkProvider());
+        var service = CreateService(maxLoadsPerTick: 128);
         service.InitializeView(session);
         session.DrainAllOutput();
 
@@ -79,6 +80,27 @@ public class ChunkStreamServiceTests
         Assert.Equal(16, update.Loaded);
         Assert.Equal(0, update.Unloaded);
         Assert.Equal(25, session.Player.ChunkView.LoadedChunks.Count);
+    }
+
+    [Fact]
+    public void UpdateView_RespectsPerTickLoadBudgetAndEventuallyConverges()
+    {
+        using var socket = CreateSocket();
+        var session = CreateSession(socket, x: 0.5, z: 0.5, radius: 1);
+        var service = CreateService(maxLoadsPerTick: 4);
+
+        var first = service.InitializeView(session);
+        Assert.Equal(4, first.Loaded);
+        Assert.Equal(-1, session.Player!.ChunkView.AppliedRadius);
+
+        var second = service.UpdateView(session);
+        var third = service.UpdateView(session);
+
+        Assert.Equal(4, second.Loaded);
+        Assert.Equal(1, third.Loaded);
+        Assert.Equal(9, session.Player.ChunkView.LoadedChunks.Count);
+        Assert.Equal(1, session.Player.ChunkView.AppliedRadius);
+        Assert.True(service.UpdateView(session).IsEmpty);
     }
 
     [Theory]
@@ -91,6 +113,12 @@ public class ChunkStreamServiceTests
         var view = new PlayerChunkView();
         Assert.Equal(expected, view.SetRequestedRadius(requested, maxRadius: 4));
     }
+
+    private static ChunkStreamService CreateService(int maxLoadsPerTick)
+        => new(new ChunkProvider(), GameServerOptions.CreateDefault() with
+        {
+            MaxChunkLoadsPerTick = maxLoadsPerTick
+        });
 
     private static SessionContext CreateSession(Socket socket, double x, double z, int radius)
     {
