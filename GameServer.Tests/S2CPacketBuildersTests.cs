@@ -44,6 +44,25 @@ public class S2CPacketBuildersTests
     }
 
     [Fact]
+    public void BuildUnloadChunk_UsesProtocol340PacketAndCoordinates()
+    {
+        var frame = S2CPacketBuilders.BuildUnloadChunk(-2, 3);
+        var off = 0;
+        Assert.True(VarIntCodec.TryRead(frame, ref off, out var payloadLength));
+        Assert.Equal(9, payloadLength); // packet id + two Int32 coordinates
+        Assert.True(VarIntCodec.TryRead(frame, ref off, out var packetId));
+        Assert.Equal(Protocol340Ids.PlayS2C.UnloadChunk, packetId);
+        Assert.Equal(0xFF, frame[off]);
+        Assert.Equal(0xFF, frame[off + 1]);
+        Assert.Equal(0xFF, frame[off + 2]);
+        Assert.Equal(0xFE, frame[off + 3]);
+        Assert.Equal(0x00, frame[off + 4]);
+        Assert.Equal(0x00, frame[off + 5]);
+        Assert.Equal(0x00, frame[off + 6]);
+        Assert.Equal(0x03, frame[off + 7]);
+    }
+
+    [Fact]
     public void BuildBlockChange_CorrectEncoding()
     {
         var frame = S2CPacketBuilders.BuildBlockChange(0, 4, 0, blockState: 3);

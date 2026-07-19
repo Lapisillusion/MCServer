@@ -143,6 +143,17 @@ public static class S2CPacketBuilders
         }, 8);
     }
 
+    /// <summary>S2C Unload Chunk (0x1D).</summary>
+    public static byte[] BuildUnloadChunk(int chunkX, int chunkZ)
+    {
+        return McProtocolWriter.BuildMcFrame(Protocol340Ids.PlayS2C.UnloadChunk, dst =>
+        {
+            var off = 0;
+            off += McProtocolWriter.WriteInt32(dst[off..], chunkX);
+            McProtocolWriter.WriteInt32(dst[off..], chunkZ);
+        }, payloadLength: 8);
+    }
+
     public static byte[] BuildChunkData(int chunkX, int chunkZ, bool groundUp,
         int primaryBitMask, byte[] rawChunkData)
     {

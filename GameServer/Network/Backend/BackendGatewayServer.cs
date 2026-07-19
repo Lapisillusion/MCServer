@@ -111,46 +111,37 @@ public sealed class BackendGatewayServer
 
             await _joinFlow.ExecuteAsync(session, cancellationToken);
 
-            Info("Session", session.SessionId, "Entering read loop, enqueuing to tick pipeline");
+            Info("Session", session.SessionId, session.PlayerName, "Entering read loop, enqueuing to tick pipeline");
 
-            // Start periodic KeepAlive sender — client disconnects after ~30s without one.
-            // In v0.3.2, KeepAlive frames are enqueued to the tick pipeline's output queue,
-            // flushed by NetworkFlushStage (single writer, no concurrency risk).
-            var keepAliveCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var keepAliveTask = RunKeepAliveLoopAsync(session, keepAliveCts.Token);
-
-            try
+            while (!cancellationToken.IsCancellationRequested &&
+                   !session.Closed && !session.CloseRequested)
             {
-                while (!cancellationToken.IsCancellationRequested && !session.Closed)
+                var frame = await McPlayFrameCodec.ReadFrameAsync(stream, cancellationToken);
+                if (frame == null)
+                    break;
+
+                session.Touch();
+                if (!McPlayFrameCodec.TryGetPacketId(frame, out var packetId))
                 {
-                    var frame = await McPlayFrameCodec.ReadFrameAsync(stream, cancellationToken);
-                    if (frame == null)
-                        break;
-
-                    session.Touch();
-                    if (!McPlayFrameCodec.TryGetPacketId(frame, out var packetId))
-                    {
-                        Warn("Session", session.SessionId, $"Invalid frame, disconnecting");
-                        break;
-                    }
-
-                    // Fast path: only deserialize and enqueue. All game logic runs in the tick loop.
-                    session.EnqueueInput(packetId, frame);
+                    Warn("Session", session.SessionId, session.PlayerName, "Invalid frame, disconnecting");
+                    break;
                 }
-            }
-            finally
-            {
-                keepAliveCts.Cancel();
-                await keepAliveTask;
-                keepAliveCts.Dispose();
+
+                // Fast path: only deserialize and enqueue. All game logic runs in the tick loop.
+                session.EnqueueInput(packetId, frame);
             }
         }
         catch (OperationCanceledException)
         {
         }
+        catch (Exception ex) when (session.CloseRequested)
+        {
+            Info("Session", session.SessionId, session.PlayerName,
+                $"Session read loop stopped after close request: {session.CloseReason ?? ex.GetType().Name}");
+        }
         catch (Exception ex)
         {
-            Error("Session", session.SessionId, $"Session loop error: {ex.GetType().Name}: {ex.Message}");
+            Error("Session", session.SessionId, session.PlayerName, $"Session loop error: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
@@ -167,23 +158,24 @@ public sealed class BackendGatewayServer
                     try
                     {
                         await _playerDataStore.SaveAsync(PlayerStatePersistence.Capture(session.Player), CancellationToken.None);
-                        Info("PlayerPersistence", session.SessionId, $"Saved player state for {playerId}");
+                        Info("PlayerPersistence", session.SessionId, session.PlayerName, "Saved player state");
                     }
                     catch (Exception ex)
                     {
-                        Error("PlayerPersistence", session.SessionId,
+                        Error("PlayerPersistence", session.SessionId, session.PlayerName,
                             $"Could not save player state: {ex.GetType().Name}: {ex.Message}");
                     }
 
                     _entityTracker.RemoveEntity(entityId);
                     _entityTracker.RemoveObserver(session.SessionId);
+                    session.Player.ChunkView.Clear();
                     _playerManager.RemovePlayer(entityId, out _);
 
                     var destroyPkt = S2CPacketBuilders.BuildDestroyEntities(new[] { entityId });
                     var listRemove = S2CPacketBuilders.BuildPlayerListItemRemove(playerId);
                     foreach (var (otherSid, other) in _sessions.All)
                     {
-                        if (other.State == GameSessionState.Play && !other.Closed)
+                        if (other.State == GameSessionState.Play && !other.Closed && !other.CloseRequested)
                         {
                             other.EnqueueOutput(destroyPkt);
                             other.EnqueueOutput(listRemove);
@@ -191,36 +183,8 @@ public sealed class BackendGatewayServer
                     }
                 }
 
-                Info("Session", session.SessionId, $"Session closed");
+                Info("Session", session.SessionId, session.PlayerName, $"Session closed, reason={session.CloseReason ?? "normal"}");
             }
-        }
-    }
-
-    private static async Task RunKeepAliveLoopAsync(SessionContext session, CancellationToken ct)
-    {
-        var keepAliveId = (long)(DateTime.UtcNow.Ticks & 0x7FFFFFFFFFFFFFFF);
-        // Send first KeepAlive after 2s, then every 5s.
-        // Vanilla client times out after ~30s of no KeepAlive.
-        const int firstDelayMs = 2000;
-        const int intervalMs = 5000;
-
-        try
-        {
-            await Task.Delay(firstDelayMs, ct);
-
-            while (!ct.IsCancellationRequested && !session.Closed)
-            {
-                var frame = S2CPacketBuilders.BuildKeepAlive(keepAliveId);
-                // Enqueue via tick pipeline — flushed by NetworkFlushStage (single writer, no concurrency risk)
-                session.EnqueueOutput(frame);
-                Info("KeepAlive", session.SessionId, $"S2C KeepAlive enqueued, id={keepAliveId}");
-                keepAliveId++;
-
-                await Task.Delay(intervalMs, ct);
-            }
-        }
-        catch (OperationCanceledException)
-        {
         }
     }
 
@@ -329,8 +293,7 @@ public sealed class BackendGatewayServer
         session.PlayerId = playerUuid;
         session.PlayerName = playerName;
 
-        Info("BackendGateway", session.SessionId,
-            $"Gateway handshake complete, playerId={playerUuid}, playerName={playerName}");
+        Info("BackendGateway", session.SessionId, playerName, "Gateway handshake complete");
     }
 
 }

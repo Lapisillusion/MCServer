@@ -10,7 +10,7 @@ namespace GameServer.Core.Diagnostics;
 ///   L0: Service (via Enrich.WithProperty in Program.cs)
 ///   L1: Module / Component
 ///   L2: SessionId
-///   L3: PlayerId, EntityId, Dimension, Gamemode
+///   L3: PlayerName, EntityId, Dimension, Gamemode
 ///   L4: PacketId, PacketName, Direction
 ///   L5: TickNumber, Stage
 /// </summary>
@@ -18,16 +18,25 @@ public static class GameLogger
 {
     // ── Full-context overloads (legacy, kept for backward compat) ──
 
-    public static void Info(string component, long sessionId, string playerId, string packetId, string message)
-        => WriteLegacy(LogEventLevel.Information, component, sessionId, playerId, packetId, message);
+    public static void Info(string component, long sessionId, string playerName, string packetId, string message)
+        => WriteLegacy(LogEventLevel.Information, component, sessionId, playerName, packetId, message);
 
-    public static void Warn(string component, long sessionId, string playerId, string packetId, string message)
-        => WriteLegacy(LogEventLevel.Warning, component, sessionId, playerId, packetId, message);
+    public static void Warn(string component, long sessionId, string playerName, string packetId, string message)
+        => WriteLegacy(LogEventLevel.Warning, component, sessionId, playerName, packetId, message);
 
-    public static void Error(string component, long sessionId, string playerId, string packetId, string message)
-        => WriteLegacy(LogEventLevel.Error, component, sessionId, playerId, packetId, message);
+    public static void Error(string component, long sessionId, string playerName, string packetId, string message)
+        => WriteLegacy(LogEventLevel.Error, component, sessionId, playerName, packetId, message);
 
-    // ── Session-only overloads (legacy) ─────────────────────
+    // ── Session/player overloads (legacy) ────────────────────
+
+    public static void Info(string component, long sessionId, string playerName, string message)
+        => WriteLegacy(LogEventLevel.Information, component, sessionId, playerName, null, message);
+
+    public static void Warn(string component, long sessionId, string playerName, string message)
+        => WriteLegacy(LogEventLevel.Warning, component, sessionId, playerName, null, message);
+
+    public static void Error(string component, long sessionId, string playerName, string message)
+        => WriteLegacy(LogEventLevel.Error, component, sessionId, playerName, null, message);
 
     public static void Info(string component, long sessionId, string message)
         => WriteLegacy(LogEventLevel.Information, component, sessionId, null, null, message);
@@ -64,16 +73,19 @@ public static class GameLogger
     // ── Internal write (legacy path) ────────────────────────
     // Now emits Component as a Serilog property (not just in template).
 
-    private static void WriteLegacy(LogEventLevel level, string component, long? sessionId, string? playerId, string? packetId, string message)
+    private static void WriteLegacy(LogEventLevel level, string component, long? sessionId, string? playerName, string? packetId, string message)
     {
         var logger = Log.Logger;
         logger = logger.ForContext("Component", component);
         logger = logger.ForContext("Module", component);
         if (sessionId.HasValue) logger = logger.ForContext("SessionId", sessionId.Value);
-        if (!string.IsNullOrEmpty(playerId)) logger = logger.ForContext("PlayerId", playerId);
+        if (!string.IsNullOrEmpty(playerName)) logger = logger.ForContext("PlayerName", playerName);
         if (!string.IsNullOrEmpty(packetId)) logger = logger.ForContext("PacketId", packetId);
 
-        logger.Write(level, "[{Component}] {Message}", component, message);
+        if (!string.IsNullOrEmpty(playerName))
+            logger.Write(level, $"[{component}] [Player:{playerName}] {{Message}}", message);
+        else
+            logger.Write(level, $"[{component}] {{Message}}", message);
     }
 
     // ── Internal write (RuntimeLogContext path) ─────────────
@@ -92,8 +104,8 @@ public static class GameLogger
             logger = logger.ForContext("SessionId", ctx.SessionId);
 
         // L3: Entity
-        if (!string.IsNullOrEmpty(ctx.PlayerId))
-            logger = logger.ForContext("PlayerId", ctx.PlayerId);
+        if (!string.IsNullOrEmpty(ctx.PlayerName))
+            logger = logger.ForContext("PlayerName", ctx.PlayerName);
         if (ctx.EntityId >= 0)
             logger = logger.ForContext("EntityId", ctx.EntityId);
         if (ctx.Dimension != int.MinValue)
@@ -119,9 +131,13 @@ public static class GameLogger
         // Serilog consuming a positional arg for {Module} (which is already
         // set via ForContext). Without this, args[0] would overwrite Module
         // and shift all subsequent property mappings by one position.
+        var playerPrefix = string.IsNullOrEmpty(ctx.PlayerName)
+            ? string.Empty
+            : $"[Player:{ctx.PlayerName}] ";
+
         if (args is { Length: > 0 })
-            logger.Write(level, $"[{module}] " + message, args);
+            logger.Write(level, $"[{module}] {playerPrefix}" + message, args);
         else
-            logger.Write(level, $"[{module}] {message}");
+            logger.Write(level, $"[{module}] {playerPrefix}{message}");
     }
 }

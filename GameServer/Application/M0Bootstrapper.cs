@@ -21,7 +21,6 @@ public static class M0Bootstrapper
 
         var context = RuntimeLogContext.Empty
             .WithSessionId("bootstrap")
-            .WithPlayerId("system")
             .WithPacketId("M0");
         _ = context.WithTickId(0);
 

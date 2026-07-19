@@ -2,7 +2,7 @@ namespace GameServer.Core.Diagnostics;
 
 public readonly record struct RuntimeLogContext(
     string SessionId,
-    string PlayerId,
+    string PlayerName,
     string PacketId,
     long TickId,
     // ── Layer 4: Packet identity ──────────────────────────
@@ -19,7 +19,7 @@ public readonly record struct RuntimeLogContext(
 {
     public static RuntimeLogContext Empty => new(
         SessionId: string.Empty,
-        PlayerId: string.Empty,
+        PlayerName: string.Empty,
         PacketId: string.Empty,
         TickId: -1,
         PacketName: string.Empty,
@@ -34,7 +34,7 @@ public readonly record struct RuntimeLogContext(
 
     public RuntimeLogContext WithSessionId(string sessionId) => this with { SessionId = sessionId };
 
-    public RuntimeLogContext WithPlayerId(string playerId) => this with { PlayerId = playerId };
+    public RuntimeLogContext WithPlayerName(string playerName) => this with { PlayerName = playerName };
 
     public RuntimeLogContext WithPacketId(string packetId) => this with { PacketId = packetId };
 

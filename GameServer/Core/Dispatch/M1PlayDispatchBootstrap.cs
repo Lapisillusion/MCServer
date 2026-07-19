@@ -1,4 +1,5 @@
 using Common.MC;
+using GameServer.Application;
 using GameServer.Core.Dispatch.Handlers;
 using GameServer.Core.Session;
 using GameServer.World;
@@ -19,9 +20,18 @@ public static class M1PlayDispatchBootstrap
     public const int C2S_PlayerBlockPlacement = Protocol340Ids.PlayC2S.PlayerBlockPlacement;
     public const int C2S_Animation = Protocol340Ids.PlayC2S.Animation;
 
-    public static PlayPacketDispatcher Build(ChunkProvider chunkProvider, SessionRegistry sessions)
+    public static PlayPacketDispatcher Build(
+        ChunkProvider chunkProvider,
+        SessionRegistry sessions,
+        ChunkStreamService? chunkStream = null,
+        GameServerOptions? options = null)
     {
-        HandlerContext.Initialize(chunkProvider, sessions);
+        var effectiveOptions = options ?? GameServerOptions.CreateDefault();
+        HandlerContext.Initialize(
+            chunkProvider,
+            sessions,
+            chunkStream ?? new ChunkStreamService(chunkProvider),
+            effectiveOptions);
 
         var dispatcher = new PlayPacketDispatcher();
 

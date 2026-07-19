@@ -52,8 +52,7 @@ public sealed class PlayerJoinFlow
         var spawn = _spawnManager.GetSpawnInfo();
 
         // 2. Create player context with unique EntityId and apply spawn defaults.
-        var player = _playerManager.CreatePlayer(session.PlayerId);
-        player.PlayerName = session.PlayerName;
+        var player = _playerManager.CreatePlayer(session.PlayerId, session.PlayerName);
         player.Dimension = spawn.Dimension;
         player.X = spawn.X;
         player.Y = spawn.Y;
@@ -61,6 +60,8 @@ public sealed class PlayerJoinFlow
         player.Yaw = spawn.Yaw;
         player.Pitch = spawn.Pitch;
         player.OnGround = true; // standing on superflat grass at Y=4.0
+        player.ChunkView.SetRequestedRadius(
+            _options.DefaultChunkViewRadius, _options.MaxChunkViewRadius);
         session.Player = player;
 
         try
@@ -69,25 +70,25 @@ public sealed class PlayerJoinFlow
             if (saved != null)
             {
                 if (PlayerStatePersistence.TryApply(player, saved, _dimensionManager, out var restoreError))
-                    Info("PlayerPersistence", session.SessionId, $"Restored player state for {player.PlayerId}");
+                    Info("PlayerPersistence", session.SessionId, session.PlayerName, "Restored player state");
                 else
-                    Warn("PlayerPersistence", session.SessionId, $"Ignored invalid player state: {restoreError}");
+                    Warn("PlayerPersistence", session.SessionId, session.PlayerName, $"Ignored invalid player state: {restoreError}");
             }
         }
         catch (Exception ex)
         {
-            Warn("PlayerPersistence", session.SessionId,
+            Warn("PlayerPersistence", session.SessionId, session.PlayerName,
                 $"Could not load player state; using spawn defaults: {ex.GetType().Name}");
         }
 
         // 3. Validate the active (restored or default) dimension before building join frames.
         var dimDef = _dimensionManager.GetDimension(player.Dimension);
 
-        Info("JoinFlow", session.SessionId,
-            $"Starting join, playerId={session.PlayerId}, entityId={player.EntityId}, " +
-            $"dimension={dimDef.Name}({spawn.Dimension}), " +
-            $"pos=({spawn.X:F2},{spawn.Y:F2},{spawn.Z:F2}), " +
-            $"yaw={spawn.Yaw:F2}, pitch={spawn.Pitch:F2}, teleportId={player.TeleportId}");
+        Info("JoinFlow", session.SessionId, session.PlayerName,
+            $"Starting join, entityId={player.EntityId}, " +
+            $"dimension={dimDef.Name}({player.Dimension}), " +
+            $"pos=({player.X:F2},{player.Y:F2},{player.Z:F2}), " +
+            $"yaw={player.Yaw:F2}, pitch={player.Pitch:F2}, teleportId={player.TeleportId}");
 
         // 4. Build join frames (6 packets + optional compression)
         var frameList = new List<(string Name, byte[] Data)>();
@@ -127,7 +128,7 @@ public sealed class PlayerJoinFlow
             var (name, data) = frames[i];
             Buffer.BlockCopy(data, 0, batch, offset, data.Length);
             offset += data.Length;
-            Info("JoinFlow", session.SessionId,
+            Info("JoinFlow", session.SessionId, session.PlayerName,
                 $"  [{i + 1}/{frames.Length}] {name} ({data.Length} bytes)");
         }
 
@@ -140,7 +141,7 @@ public sealed class PlayerJoinFlow
         // 6. Transition to Play
         session.State = GameSessionState.Play;
 
-        Info("JoinFlow", session.SessionId,
+        Info("JoinFlow", session.SessionId, session.PlayerName,
             $"Join sequence complete, {frames.Length} frames, {totalBytes} total bytes batched, compression={_options.EnableCompression}");
 
         // 7. Multiplayer: broadcast PlayerListItem to all players.
@@ -171,7 +172,7 @@ public sealed class PlayerJoinFlow
         }
 
         if (existingPlayers > 0)
-            Info("JoinFlow", session.SessionId,
+            Info("JoinFlow", session.SessionId, session.PlayerName,
                 $"Multiplayer broadcast: {existingPlayers} existing players notified via PlayerListItem");
     }
 }

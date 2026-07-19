@@ -39,9 +39,12 @@ internal static class ClientSettingsHandler
         if (!McPlayFrameCodec.TryReadVarInt(span, ref off, out var mainHand))
             return ValueTask.CompletedTask;
 
+        var appliedViewDistance = session.Player?.ChunkView.SetRequestedRadius(
+            viewDistance, HandlerContext.Options.MaxChunkViewRadius);
+
         Info("PlayPacket", context,
-            "ClientSettings received {Locale} {ViewDistance} {ChatFlags} {ChatColors} {SkinParts} {MainHand}",
-            locale, viewDistance, chatFlags, chatColors, skinParts, mainHand);
+            "ClientSettings received {Locale} requestedView={ViewDistance} appliedView={AppliedViewDistance} {ChatFlags} {ChatColors} {SkinParts} {MainHand}",
+            locale, viewDistance, appliedViewDistance ?? 0, chatFlags, chatColors, skinParts, mainHand);
         return ValueTask.CompletedTask;
     }
 }

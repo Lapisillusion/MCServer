@@ -24,10 +24,16 @@ internal static class TeleportConfirmHandler
         if (session.Player == null || session.Player.ChunksSent)
             return ValueTask.CompletedTask;
 
+        if (teleportId != session.Player.TeleportId)
+        {
+            Warn("PlayPacket", context,
+                "Ignored unexpected TeleportConfirm {TeleportId}; expected {ExpectedTeleportId}",
+                teleportId, session.Player.TeleportId);
+            return ValueTask.CompletedTask;
+        }
+
+        HandlerContext.ChunkStream.InitializeView(session);
         session.Player.ChunksSent = true;
-
-        HandlerContext.ChunkStream.SendSpawnGrid(session, centerX: 0, centerZ: 0, radius: 1);
-
         return ValueTask.CompletedTask;
     }
 

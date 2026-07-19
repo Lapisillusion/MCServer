@@ -30,7 +30,7 @@ public sealed class NetworkFlushStage : ITickStage
     {
         foreach (var (sid, session) in _sessions.All)
         {
-            if (session.Closed || session.Stream == null) continue;
+            if (session.Closed || session.CloseRequested || session.Stream == null) continue;
 
             var frames = session.DrainAllOutput();
             if (frames.Count == 0) continue;
@@ -63,7 +63,7 @@ public sealed class NetworkFlushStage : ITickStage
             await session.Stream.FlushAsync(ct);
 
             if (totalBytes > 8192)
-                Info("NetworkFlush", sid,
+                Info("NetworkFlush", sid, session.PlayerName,
                     $"Tick #{tickNumber}: {wrappedFrames.Count} frames, {totalBytes}B batched");
         }
     }

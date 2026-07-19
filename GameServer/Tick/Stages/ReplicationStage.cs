@@ -36,7 +36,7 @@ public sealed class ReplicationStage : ITickStage
         var active = new List<SessionContext>();
         foreach (var (_, session) in _sessions.All)
         {
-            if (!session.Closed && session.State == GameSessionState.Play && session.Player != null)
+            if (!session.Closed && !session.CloseRequested && session.State == GameSessionState.Play && session.Player != null)
                 active.Add(session);
         }
 

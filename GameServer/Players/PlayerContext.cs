@@ -1,4 +1,5 @@
 using GameServer.Inventory;
+using GameServer.World;
 
 namespace GameServer.Players;
 
@@ -15,8 +16,8 @@ public sealed class PlayerContext
     public float Yaw { get; set; }
     public float Pitch { get; set; } = 90f;
     public bool OnGround { get; set; }
-    public long LastKeepAliveId { get; set; }
     public bool ChunksSent { get; set; }
     public int TeleportId { get; set; } = 1;
     public HotbarInventory Hotbar { get; } = HotbarInventory.CreateDefault();
+    public PlayerChunkView ChunkView { get; } = new();
 }

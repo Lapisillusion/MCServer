@@ -27,11 +27,11 @@ public sealed class InputCollectStage : ITickStage
     {
         foreach (var (sid, session) in _sessions.All)
         {
-            if (session.Closed) continue;
+            if (session.Closed || session.CloseRequested) continue;
 
             var baseContext = RuntimeLogContext.Empty
                 .WithSessionId(sid.ToString())
-                .WithPlayerId(session.PlayerId)
+                .WithPlayerName(session.PlayerName)
                 .WithTickId(tickNumber)
                 .WithStage(nameof(TickPipelineStage.InputCollect));
 
@@ -59,7 +59,7 @@ public sealed class InputCollectStage : ITickStage
             }
 
             if (processed > 32)
-                Warn("InputCollect", sid,
+                Warn("InputCollect", sid, session.PlayerName,
                     $"Tick #{tickNumber}: processed {processed} frames — input queue backlog");
         }
     }

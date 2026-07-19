@@ -340,8 +340,8 @@ public sealed class GateWayServer
 
         if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
         {
-            Logger.Debug("Client recv closed, ctxId={ContextId}, socketError={SocketError}, bytes={Bytes}",
-                ctx.Id, e.SocketError, e.BytesTransferred);
+            Logger.Debug("Client recv closed, ctxId={ContextId}, playerName={PlayerName}, socketError={SocketError}, bytes={Bytes}",
+                ctx.Id, ctx.PlayerName ?? "-", e.SocketError, e.BytesTransferred);
             CloseContext(ctx, false, "client-recv-closed");
             return;
         }
@@ -358,7 +358,8 @@ public sealed class GateWayServer
         }
         catch (Exception ex)
         {
-            Logger.Warning(ex, "Client frame processing failed, ctxId={ContextId}", ctx.Id);
+            Logger.Warning(ex, "Client frame processing failed, ctxId={ContextId}, playerName={PlayerName}",
+                ctx.Id, ctx.PlayerName ?? "-");
             RegisterInvalidPacketAndClose(ctx);
             return;
         }
@@ -591,15 +592,16 @@ public sealed class GateWayServer
         var backend = ctx.Backend;
         if (backend == null)
         {
-            Logger.Warning("Backend recv callback without backend socket, ctxId={ContextId}", ctx.Id);
+            Logger.Warning("Backend recv callback without backend socket, ctxId={ContextId}, playerName={PlayerName}",
+                ctx.Id, ctx.PlayerName ?? "-");
             CloseContext(ctx, false, "backend-missing");
             return;
         }
 
         if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
         {
-            Logger.Debug("Backend recv closed, ctxId={ContextId}, socketError={SocketError}, bytes={Bytes}",
-                ctx.Id, e.SocketError, e.BytesTransferred);
+            Logger.Debug("Backend recv closed, ctxId={ContextId}, playerName={PlayerName}, socketError={SocketError}, bytes={Bytes}",
+                ctx.Id, ctx.PlayerName ?? "-", e.SocketError, e.BytesTransferred);
             CloseContext(ctx, false, "backend-recv-closed");
             return;
         }
@@ -629,7 +631,8 @@ public sealed class GateWayServer
             return;
         if (!ctx.HasBackend)
         {
-            Logger.Warning("Cannot promote login without backend attached, ctxId={ContextId}", ctx.Id);
+            Logger.Warning("Cannot promote login without backend attached, ctxId={ContextId}, playerName={PlayerName}",
+                ctx.Id, playerName);
             SendLoginDisconnectAndClose(ctx, "GameServer is unavailable, please retry.");
             return;
         }
@@ -660,8 +663,8 @@ public sealed class GateWayServer
         StartReceive(ctx.Backend!, ctx.BackendRecvSaea!);
 
         ReleaseLoginSlot(ctx);
-        Logger.Information("State transition, ctxId={ContextId}, from={FromState}, to={ToState}, playerName={PlayerName}, playerUuid={PlayerUuid}",
-            ctx.Id, ConnState.Login, ConnState.Play, playerName, playerUuid);
+        Logger.Information("State transition, ctxId={ContextId}, from={FromState}, to={ToState}, playerName={PlayerName}",
+            ctx.Id, ConnState.Login, ConnState.Play, playerName);
     }
 
     private static string BuildOfflinePlayerUuid(string playerName)
@@ -781,20 +784,23 @@ public sealed class GateWayServer
             State = stateBefore.ToString(),
             PacketId = $"0x{packetId:X2}",
             PacketName = packetName,
+            PlayerName = ctx.PlayerName ?? string.Empty,
             FrameLength = frameLen,
             PayloadLength = payloadLen,
             ForwardToBackend = forwardToBackend,
             Parsed = parsed
         };
 
-        Logger.Information("Parsed packet {PacketName} {@Packet}", packetName, result);
+        Logger.Information("Parsed packet {PacketName}, playerName={PlayerName} {@Packet}",
+            packetName, ctx.PlayerName ?? "-", result);
     }
 
     private void EnqueueBackendZeroCopy(ConnectionContext ctx, ArraySegment<byte> seg1, ArraySegment<byte> seg2, int totalLen)
     {
         if (!ctx.HasBackend)
         {
-            Logger.Warning("Drop forward packet because backend is not attached, ctxId={ContextId}", ctx.Id);
+            Logger.Warning("Drop forward packet because backend is not attached, ctxId={ContextId}, playerName={PlayerName}",
+                ctx.Id, ctx.PlayerName ?? "-");
             CloseContext(ctx, false, "backend-not-attached");
             return;
         }
@@ -892,8 +898,8 @@ public sealed class GateWayServer
 
         if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
         {
-            Logger.Debug("Send failed, ctxId={ContextId}, channel={Channel}, socketError={SocketError}, bytes={Bytes}",
-                ctx.Id, channelName, e.SocketError, e.BytesTransferred);
+            Logger.Debug("Send failed, ctxId={ContextId}, playerName={PlayerName}, channel={Channel}, socketError={SocketError}, bytes={Bytes}",
+                ctx.Id, ctx.PlayerName ?? "-", channelName, e.SocketError, e.BytesTransferred);
             CloseContext(ctx, false, "send-failed");
             return;
         }
@@ -907,7 +913,8 @@ public sealed class GateWayServer
             var item = channel.Current;
             if (item == null)
             {
-                Logger.Warning("Send channel invariant broken, ctxId={ContextId}, channel={Channel}", ctx.Id, channelName);
+                Logger.Warning("Send channel invariant broken, ctxId={ContextId}, playerName={PlayerName}, channel={Channel}",
+                    ctx.Id, ctx.PlayerName ?? "-", channelName);
                 CloseContext(ctx, false, "send-channel-invariant");
                 return;
             }
@@ -1031,8 +1038,8 @@ public sealed class GateWayServer
     private void RegisterInvalidPacketAndClose(ConnectionContext ctx)
     {
         var count = Interlocked.Increment(ref ctx.InvalidPacketCount);
-        Logger.Warning("Invalid packet detected, ctxId={ContextId}, count={Count}, threshold={Threshold}",
-            ctx.Id, count, InvalidPacketBanThreshold);
+        Logger.Warning("Invalid packet detected, ctxId={ContextId}, playerName={PlayerName}, count={Count}, threshold={Threshold}",
+            ctx.Id, ctx.PlayerName ?? "-", count, InvalidPacketBanThreshold);
         if (count >= InvalidPacketBanThreshold)
             CloseContext(ctx, true, "invalid-packet-threshold");
         else
@@ -1071,8 +1078,8 @@ public sealed class GateWayServer
         if (!ctx.TryMarkClosed())
             return;
 
-        Logger.Information("Closing connection, ctxId={ContextId}, ip={Ip}, state={State}, tempBan={TempBan}, reason={Reason}",
-            ctx.Id, FormatIpv4(ctx.IpV4), ctx.State, tempBan, reason);
+        Logger.Information("Closing connection, ctxId={ContextId}, playerName={PlayerName}, ip={Ip}, state={State}, tempBan={TempBan}, reason={Reason}",
+            ctx.Id, ctx.PlayerName ?? "-", FormatIpv4(ctx.IpV4), ctx.State, tempBan, reason);
 
         if (tempBan)
         {

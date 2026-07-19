@@ -79,6 +79,19 @@ public class PlayerPersistenceTests
     }
 
     [Fact]
+    public void TryApply_UnstreamableCoordinatesLeaveSpawnDefaultsUntouched()
+    {
+        var player = new PlayerManager().CreatePlayer("player-1");
+        var slots = player.Hotbar.Snapshot();
+        var saved = new PlayerSaveData(
+            "player-1", 0, double.MaxValue, 4, 0.5, 0, 0, true, 0, slots);
+
+        Assert.False(PlayerStatePersistence.TryApply(player, saved, CreateDimensions(), out _));
+        Assert.Equal(0.5, player.X);
+        Assert.Equal(0.5, player.Z);
+    }
+
+    [Fact]
     public void HotbarRestore_RejectsInvalidStackWithoutChangingExistingItems()
     {
         var hotbar = HotbarInventory.CreateDefault();

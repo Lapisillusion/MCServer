@@ -14,13 +14,14 @@ public sealed class PlayerManager
 
     public int Count => _players.Count;
 
-    public PlayerContext CreatePlayer(string playerId)
+    public PlayerContext CreatePlayer(string playerId, string playerName = "")
     {
         var entityId = Interlocked.Increment(ref _nextEntityId);
         var player = new PlayerContext
         {
             EntityId = entityId,
             PlayerId = playerId,
+            PlayerName = playerName,
             Gamemode = 0,
             Dimension = 0,
             X = 0.5,
@@ -34,7 +35,7 @@ public sealed class PlayerManager
         if (!_players.TryAdd(entityId, player))
             throw new InvalidOperationException($"EntityId collision: {entityId}");
 
-        Info("PlayerManager", 0, playerId, "",
+        Info("PlayerManager", 0, playerName, "",
             $"Player created, entityId={entityId}, total players={_players.Count}");
 
         return player;
@@ -48,7 +49,7 @@ public sealed class PlayerManager
         if (!_players.TryRemove(entityId, out player))
             return false;
 
-        Info("PlayerManager", 0, player.PlayerId, "",
+        Info("PlayerManager", 0, player.PlayerName, "",
             $"Player removed, entityId={entityId}, total players={_players.Count}");
         return true;
     }

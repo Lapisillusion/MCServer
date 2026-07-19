@@ -1,6 +1,7 @@
 using GameServer.Dimension;
 using GameServer.Movement;
 using GameServer.Players;
+using GameServer.World;
 
 namespace GameServer.Persistence;
 
@@ -49,7 +50,8 @@ public static class PlayerStatePersistence
         var movement = MovementConfig.Default;
         if (!double.IsFinite(saved.X) || !double.IsFinite(saved.Y) || !double.IsFinite(saved.Z) ||
             saved.Y < movement.MinY || saved.Y > movement.MaxY ||
-            !float.IsFinite(saved.Yaw) || !float.IsFinite(saved.Pitch))
+            !float.IsFinite(saved.Yaw) || !float.IsFinite(saved.Pitch) ||
+            !ChunkPos.TryFromWorldPosition(saved.X, saved.Z, out _))
         {
             error = "Saved position or rotation is invalid";
             return false;
