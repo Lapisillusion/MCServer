@@ -2,6 +2,7 @@ using Common.MC;
 using GameServer.Application;
 using GameServer.Core.Dispatch.Handlers;
 using GameServer.Core.Session;
+using GameServer.Movement;
 using GameServer.World;
 
 namespace GameServer.Core.Dispatch;
@@ -24,14 +25,16 @@ public static class M1PlayDispatchBootstrap
         ChunkProvider chunkProvider,
         SessionRegistry sessions,
         ChunkStreamService? chunkStream = null,
-        GameServerOptions? options = null)
+        GameServerOptions? options = null,
+        PlayerMovementService? movement = null)
     {
         var effectiveOptions = options ?? GameServerOptions.CreateDefault();
         HandlerContext.Initialize(
             chunkProvider,
             sessions,
             chunkStream ?? new ChunkStreamService(chunkProvider),
-            effectiveOptions);
+            effectiveOptions,
+            movement ?? new PlayerMovementService(chunkProvider));
 
         var dispatcher = new PlayPacketDispatcher();
 

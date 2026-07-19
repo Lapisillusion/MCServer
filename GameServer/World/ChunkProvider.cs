@@ -30,6 +30,36 @@ public sealed class ChunkProvider
         => _columns.TryGetValue(pos.ToLong(), out column!);
 
     /// <summary>
+    /// Reads a world block state without generating missing chunks. Returns false only when
+    /// the target chunk is unavailable or the coordinate cannot map to a protocol chunk.
+    /// </summary>
+    public bool TryGetBlockState(long worldX, int worldY, long worldZ, out int blockState)
+    {
+        blockState = SuperflatChunkBuilder.State_Air;
+        if (worldY is < 0 or > 255)
+            return true;
+
+        var chunkXLong = worldX >> 4;
+        var chunkZLong = worldZ >> 4;
+        if (chunkXLong is < int.MinValue or > int.MaxValue ||
+            chunkZLong is < int.MinValue or > int.MaxValue)
+            return false;
+
+        if (!TryGetColumn(new ChunkPos((int)chunkXLong, (int)chunkZLong), out var column))
+            return false;
+
+        var section = column.GetSection(worldY >> 4);
+        if (section == null)
+            return true;
+
+        blockState = section.GetBlock(
+            (int)(worldX & 0xF),
+            worldY & 0xF,
+            (int)(worldZ & 0xF));
+        return true;
+    }
+
+    /// <summary>
     /// Generate a (2*radius+1) × (2*radius+1) grid centered on (cx, cz).
     /// Each column is independently generated/cached.
     /// </summary>

@@ -2,6 +2,7 @@ using GameServer.Application;
 using GameServer.Core.Dispatch;
 using GameServer.Core.Session;
 using GameServer.Dimension;
+using GameServer.Movement;
 using GameServer.Network;
 using GameServer.Network.Backend;
 using GameServer.Players;
@@ -58,13 +59,16 @@ public static class Program
             var chunkProvider = new ChunkProvider();
 
             var chunkStream = new ChunkStreamService(chunkProvider);
-            var playDispatcher = M1PlayDispatchBootstrap.Build(chunkProvider, sessions, chunkStream, options);
+            var movement = new PlayerMovementService(chunkProvider);
+            var physics = new PlayerPhysicsService(movement);
+            var playDispatcher = M1PlayDispatchBootstrap.Build(
+                chunkProvider, sessions, chunkStream, options, movement);
             var server = new BackendGatewayServer(options, sessions, playDispatcher, joinFlow, entityTracker, playerManager, playerDataStore);
 
             // v0.3.2 — Tick Pipeline stages (InputCollect → Simulate → Replication → NetworkFlush)
             var inputCollect = new InputCollectStage(sessions, playDispatcher);
             var liveness = new SessionLivenessService(options);
-            var simulate = new SimulateStage(sessions, liveness, chunkStream);
+            var simulate = new SimulateStage(sessions, liveness, chunkStream, physics);
             var replication = new ReplicationStage(sessions, entityTracker);
             var networkFlush = new NetworkFlushStage(sessions, options);
 

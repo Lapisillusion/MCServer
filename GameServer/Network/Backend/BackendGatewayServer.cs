@@ -166,6 +166,7 @@ public sealed class BackendGatewayServer
                             $"Could not save player state: {ex.GetType().Name}: {ex.Message}");
                     }
 
+                    session.Player.Removed = true;
                     _entityTracker.RemoveEntity(entityId);
                     _entityTracker.RemoveObserver(session.SessionId);
                     session.Player.ChunkView.Clear();

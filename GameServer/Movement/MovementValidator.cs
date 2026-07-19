@@ -1,3 +1,5 @@
+using GameServer.World;
+
 namespace GameServer.Movement;
 
 /// <summary>Pure validation functions — no side effects.</summary>
@@ -28,6 +30,10 @@ public static class MovementValidator
             double.IsNaN(newY) || double.IsInfinity(newY) ||
             double.IsNaN(newZ) || double.IsInfinity(newZ))
             return "Position contains NaN or Infinity";
+
+        // Protocol/world coordinate bounds
+        if (!ChunkPos.TryFromWorldPosition(newX, newZ, out _))
+            return "Position cannot map to a protocol chunk";
 
         // Y bounds
         if (newY < config.MinY || newY > config.MaxY)

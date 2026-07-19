@@ -1,23 +1,27 @@
+using GameServer.Entities;
 using GameServer.Inventory;
 using GameServer.World;
 
 namespace GameServer.Players;
 
-public sealed class PlayerContext
+public sealed class PlayerContext : EntityState
 {
+    public PlayerContext()
+    {
+        X = 0.5;
+        Y = 4.0;
+        Z = 0.5;
+        Pitch = 90f;
+    }
     public string PlayerId { get; set; } = string.Empty;
     public string PlayerName { get; set; } = string.Empty;
-    public int EntityId { get; set; }
+    public override double Width => 0.6;
+    public override double Height => 1.8;
     public byte Gamemode { get; set; }
-    public int Dimension { get; set; }
-    public double X { get; set; } = 0.5;
-    public double Y { get; set; } = 4.0;
-    public double Z { get; set; } = 0.5;
-    public float Yaw { get; set; }
-    public float Pitch { get; set; } = 90f;
-    public bool OnGround { get; set; }
     public bool ChunksSent { get; set; }
     public int TeleportId { get; set; } = 1;
+    public bool AwaitingTeleportConfirm { get; set; }
+    public long LastClientPositionTick { get; set; } = -1;
     public HotbarInventory Hotbar { get; } = HotbarInventory.CreateDefault();
     public PlayerChunkView ChunkView { get; } = new();
 }

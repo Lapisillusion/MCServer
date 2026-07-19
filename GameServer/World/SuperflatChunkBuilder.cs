@@ -35,8 +35,9 @@ public static class SuperflatChunkBuilder
     public const int State_Dirt = 48;     // (3 << 4) | 0
     public const int State_Bedrock = 112; // (7 << 4) | 0
 
-    // Shared cached data — all superflat sections are identical.
-    private static byte[]? _cachedBlockStates;
+    // Shared immutable data. Section 0 contains terrain; higher sections start as air.
+    private static byte[]? _cachedGroundBlockStates;
+    private static byte[]? _cachedAirBlockStates;
     private static byte[]? _cachedBlockLight;
     private static byte[]? _cachedSkyLight;
     private static byte[]? _cachedBiomes;
@@ -51,15 +52,16 @@ public static class SuperflatChunkBuilder
     /// </summary>
     public static byte[] GetSectionBlockStates(int sectionY)
     {
-        if (_cachedBlockStates != null)
-            return _cachedBlockStates;
+        if (sectionY != 0)
+            return _cachedAirBlockStates ??= new byte[BlockCount];
+
+        if (_cachedGroundBlockStates != null)
+            return _cachedGroundBlockStates;
 
         var states = new byte[BlockCount];
-        var baseY = sectionY * 16;
-
         for (var y = 0; y < 16; y++)
         {
-            byte blockState = (baseY + y) switch
+            byte blockState = y switch
             {
                 0 => (byte)State_Bedrock,
                 1 or 2 => (byte)State_Dirt,
@@ -69,12 +71,10 @@ public static class SuperflatChunkBuilder
 
             for (var z = 0; z < 16; z++)
             for (var x = 0; x < 16; x++)
-            {
                 states[BlockIndex(x, y, z)] = blockState;
-            }
         }
 
-        _cachedBlockStates = states;
+        _cachedGroundBlockStates = states;
         return states;
     }
 

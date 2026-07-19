@@ -60,6 +60,7 @@ public sealed class PlayerJoinFlow
         player.Yaw = spawn.Yaw;
         player.Pitch = spawn.Pitch;
         player.OnGround = true; // standing on superflat grass at Y=4.0
+        player.AwaitingTeleportConfirm = true;
         player.ChunkView.SetRequestedRadius(
             _options.DefaultChunkViewRadius, _options.MaxChunkViewRadius);
         session.Player = player;

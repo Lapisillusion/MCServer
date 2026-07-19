@@ -21,19 +21,25 @@ internal static class TeleportConfirmHandler
         Info("PlayPacket", context,
             "TeleportConfirm received {TeleportId}", teleportId);
 
-        if (session.Player == null || session.Player.ChunksSent)
+        var player = session.Player;
+        if (player == null)
             return ValueTask.CompletedTask;
 
-        if (teleportId != session.Player.TeleportId)
+        if (teleportId != player.TeleportId)
         {
             Warn("PlayPacket", context,
                 "Ignored unexpected TeleportConfirm {TeleportId}; expected {ExpectedTeleportId}",
-                teleportId, session.Player.TeleportId);
+                teleportId, player.TeleportId);
             return ValueTask.CompletedTask;
         }
 
-        HandlerContext.ChunkStream.InitializeView(session);
-        session.Player.ChunksSent = true;
+        player.AwaitingTeleportConfirm = false;
+        if (!player.ChunksSent)
+        {
+            HandlerContext.ChunkStream.InitializeView(session);
+            player.ChunksSent = true;
+        }
+
         return ValueTask.CompletedTask;
     }
 

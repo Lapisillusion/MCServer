@@ -75,6 +75,17 @@ public class MovementValidatorTests
     }
 
     [Fact]
+    public void ValidatePosition_UnstreamableHorizontalCoordinateReturnsError()
+    {
+        var reason = MovementValidator.ValidatePosition(
+            double.MaxValue, 4.0, 0.5,
+            0.5, 4.0, 0.5, Config);
+
+        Assert.NotNull(reason);
+        Assert.Contains("protocol chunk", reason);
+    }
+
+    [Fact]
     public void ValidateLook_NanYaw_ReturnsError()
     {
         var reason = MovementValidator.ValidateLook(float.NaN, 0f);

@@ -1,8 +1,7 @@
-using System.Buffers.Binary;
+﻿using System.Buffers.Binary;
 using GameServer.Core.Diagnostics;
 using GameServer.Core.Session;
 using GameServer.Movement;
-using GameServer.Network;
 using GameServer.Network.Backend;
 using static GameServer.Core.Diagnostics.GameLogger;
 
@@ -18,17 +17,14 @@ internal static class MovementHandlers
             return ValueTask.CompletedTask;
 
         var span = frame.Span;
-        if (off >= span.Length)
+        if (off >= span.Length || session.Player == null)
             return ValueTask.CompletedTask;
 
-        var onGround = span[off] != 0;
-        if (session.Player != null)
-        {
-            session.Player.OnGround = onGround;
-            Info("Movement", context,
-                "Player position update {OnGround}", onGround);
-        }
-
+        var clientOnGround = span[off] != 0;
+        var serverOnGround = HandlerContext.Movement.RefreshGroundState(session.Player);
+        Info("Movement", context,
+            "Ground state client={ClientOnGround} server={ServerOnGround}",
+            clientOnGround, serverOnGround);
         return ValueTask.CompletedTask;
     }
 
@@ -46,34 +42,9 @@ internal static class MovementHandlers
         var x = BinaryPrimitives.ReadDoubleBigEndian(span[off..]); off += 8;
         var y = BinaryPrimitives.ReadDoubleBigEndian(span[off..]); off += 8;
         var z = BinaryPrimitives.ReadDoubleBigEndian(span[off..]); off += 8;
-        var onGround = span[off] != 0;
+        var clientOnGround = span[off] != 0;
 
-        if (session.Player != null)
-        {
-            var config = MovementConfig.Default;
-            var reason = MovementValidator.ValidatePosition(x, y, z,
-                session.Player.X, session.Player.Y, session.Player.Z, config);
-
-            if (reason != null)
-            {
-                Warn("Movement", context,
-                    "PlayerPosition rejected {Reason}, force-syncing", reason);
-                var tp = S2CPacketBuilders.BuildEntityTeleport(
-                    session.Player.EntityId,
-                    session.Player.X, session.Player.Y, session.Player.Z,
-                    session.Player.Yaw, session.Player.Pitch, session.Player.OnGround);
-                session.EnqueueOutput(tp);
-                return ValueTask.CompletedTask;
-            }
-
-            session.Player.X = x;
-            session.Player.Y = y;
-            session.Player.Z = z;
-            session.Player.OnGround = onGround;
-            Info("Movement", context,
-                "PlayerPosition {X:F2} {Y:F2} {Z:F2} {OnGround}", x, y, z, onGround);
-        }
-
+        ApplyPosition(session, context, x, y, z, clientOnGround);
         return ValueTask.CompletedTask;
     }
 
@@ -93,38 +64,26 @@ internal static class MovementHandlers
         var z = BinaryPrimitives.ReadDoubleBigEndian(span[off..]); off += 8;
         var yaw = BinaryPrimitives.ReadSingleBigEndian(span[off..]); off += 4;
         var pitch = BinaryPrimitives.ReadSingleBigEndian(span[off..]); off += 4;
-        var onGround = span[off] != 0;
+        var clientOnGround = span[off] != 0;
 
-        if (session.Player != null)
+        var player = session.Player;
+        if (player == null)
+            return ValueTask.CompletedTask;
+
+        var reason = MovementValidator.ValidatePositionAndLook(
+            x, y, z, yaw, pitch,
+            player.X, player.Y, player.Z,
+            player.Yaw, player.Pitch,
+            MovementConfig.Default);
+        if (reason != null)
         {
-            var config = MovementConfig.Default;
-            var reason = MovementValidator.ValidatePositionAndLook(
-                x, y, z, yaw, pitch,
-                session.Player.X, session.Player.Y, session.Player.Z,
-                session.Player.Yaw, session.Player.Pitch, config);
-
-            if (reason != null)
-            {
-                Warn("Movement", context,
-                    "PlayerPositionAndLook rejected {Reason}, force-syncing", reason);
-                var tp = S2CPacketBuilders.BuildEntityTeleport(
-                    session.Player.EntityId,
-                    session.Player.X, session.Player.Y, session.Player.Z,
-                    session.Player.Yaw, session.Player.Pitch, session.Player.OnGround);
-                session.EnqueueOutput(tp);
-                return ValueTask.CompletedTask;
-            }
-
-            session.Player.X = x;
-            session.Player.Y = y;
-            session.Player.Z = z;
-            session.Player.Yaw = yaw;
-            session.Player.Pitch = pitch;
-            session.Player.OnGround = onGround;
-            Info("Movement", context,
-                "PlayerPositionAndLook {X:F2} {Y:F2} {Z:F2} {Yaw:F2} {Pitch:F2} {OnGround}", x, y, z, yaw, pitch, onGround);
+            RejectAndCorrect(session, context, "PlayerPositionAndLook", reason);
+            return ValueTask.CompletedTask;
         }
 
+        player.Yaw = yaw;
+        player.Pitch = pitch;
+        ApplyValidatedPosition(session, context, x, y, z, clientOnGround, "PlayerPositionAndLook");
         return ValueTask.CompletedTask;
     }
 
@@ -141,30 +100,98 @@ internal static class MovementHandlers
 
         var yaw = BinaryPrimitives.ReadSingleBigEndian(span[off..]); off += 4;
         var pitch = BinaryPrimitives.ReadSingleBigEndian(span[off..]); off += 4;
-        var onGround = span[off] != 0;
+        var clientOnGround = span[off] != 0;
 
-        if (session.Player != null)
+        var player = session.Player;
+        if (player == null)
+            return ValueTask.CompletedTask;
+
+        var reason = MovementValidator.ValidateLook(yaw, pitch);
+        if (reason != null)
         {
-            var reason = MovementValidator.ValidateLook(yaw, pitch);
-            if (reason != null)
-            {
-                Warn("Movement", context,
-                    "PlayerLook rejected {Reason}, force-syncing", reason);
-                var tp = S2CPacketBuilders.BuildEntityTeleport(
-                    session.Player.EntityId,
-                    session.Player.X, session.Player.Y, session.Player.Z,
-                    session.Player.Yaw, session.Player.Pitch, session.Player.OnGround);
-                session.EnqueueOutput(tp);
-                return ValueTask.CompletedTask;
-            }
-
-            session.Player.Yaw = yaw;
-            session.Player.Pitch = pitch;
-            session.Player.OnGround = onGround;
-            Info("Movement", context,
-                "PlayerLook {Yaw:F2} {Pitch:F2} {OnGround}", yaw, pitch, onGround);
+            RejectAndCorrect(session, context, "PlayerLook", reason);
+            return ValueTask.CompletedTask;
         }
 
+        player.Yaw = yaw;
+        player.Pitch = pitch;
+        var serverOnGround = HandlerContext.Movement.RefreshGroundState(player);
+        Info("Movement", context,
+            "PlayerLook yaw={Yaw:F2} pitch={Pitch:F2} clientGround={ClientOnGround} serverGround={ServerOnGround}",
+            yaw, pitch, clientOnGround, serverOnGround);
         return ValueTask.CompletedTask;
+    }
+
+    private static void ApplyPosition(
+        SessionContext session,
+        in RuntimeLogContext context,
+        double x,
+        double y,
+        double z,
+        bool clientOnGround)
+    {
+        var player = session.Player;
+        if (player == null)
+            return;
+
+        var reason = MovementValidator.ValidatePosition(
+            x, y, z,
+            player.X, player.Y, player.Z,
+            MovementConfig.Default);
+        if (reason != null)
+        {
+            RejectAndCorrect(session, context, "PlayerPosition", reason);
+            return;
+        }
+
+        ApplyValidatedPosition(session, context, x, y, z, clientOnGround, "PlayerPosition");
+    }
+
+    private static void ApplyValidatedPosition(
+        SessionContext session,
+        in RuntimeLogContext context,
+        double x,
+        double y,
+        double z,
+        bool clientOnGround,
+        string packetName)
+    {
+        var player = session.Player!;
+        if (player.AwaitingTeleportConfirm)
+        {
+            Warn("Movement", context,
+                "Ignored {PacketName} while awaiting TeleportConfirm {TeleportId}",
+                packetName, player.TeleportId);
+            return;
+        }
+
+        var result = HandlerContext.Movement.MoveTo(player, x, y, z, context.TickId);
+        if (result.WasClipped)
+        {
+            Warn("Movement", context,
+                "{PacketName} clipped requested=({RequestedX:F3},{RequestedY:F3},{RequestedZ:F3}) resolved=({ResolvedX:F3},{ResolvedY:F3},{ResolvedZ:F3})",
+                packetName,
+                x, y, z,
+                result.X, result.Y, result.Z);
+            PlayerMovementService.EnqueuePositionCorrection(session);
+            return;
+        }
+
+        Info("Movement", context,
+            "{PacketName} accepted pos=({X:F3},{Y:F3},{Z:F3}) clientGround={ClientOnGround} serverGround={ServerOnGround}",
+            packetName,
+            result.X, result.Y, result.Z,
+            clientOnGround, player.OnGround);
+    }
+
+    private static void RejectAndCorrect(
+        SessionContext session,
+        in RuntimeLogContext context,
+        string packetName,
+        string reason)
+    {
+        Warn("Movement", context,
+            "{PacketName} rejected {Reason}; correcting client", packetName, reason);
+        PlayerMovementService.EnqueuePositionCorrection(session);
     }
 }
